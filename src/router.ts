@@ -19,6 +19,13 @@ import {
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
 import { ociImageIndexContentType } from "./registry/r2";
+import {
+  blobCacheHeaders,
+  manifestCacheHeaders,
+  maybeNotModified,
+  populateEdgeCache,
+  tryServeFromEdgeCache,
+} from "./cache";
 
 const maxReferrersListLimit = 1000;
 const isOpaqueReferrersCursor = (cursor: string) => cursor.startsWith("/v2/");
@@ -148,6 +155,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...manifestCacheHeaders(res.digest),
       },
     });
   }
@@ -207,6 +215,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       "Content-Length": checkManifestResponse.size.toString(),
       "Content-Type": checkManifestResponse.contentType,
       "Docker-Content-Digest": checkManifestResponse.digest,
+      ...manifestCacheHeaders(checkManifestResponse.digest),
     },
   });
 });
@@ -215,11 +224,14 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
   const { name, reference } = req.params;
   const res = await env.REGISTRY_CLIENT.getManifest(name, reference);
   if (!("response" in res)) {
+    const notModified = maybeNotModified(req as unknown as Request, res.digest, manifestCacheHeaders);
+    if (notModified) return notModified;
     return new Response(res.stream, {
       headers: {
         "Content-Length": res.size.toString(),
         "Content-Type": res.contentType,
         "Docker-Content-Digest": res.digest,
+        ...manifestCacheHeaders(res.digest),
       },
     });
   }
@@ -270,6 +282,7 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
       "Content-Length": getManifestResponse.size.toString(),
       "Content-Type": getManifestResponse.contentType,
       "Docker-Content-Digest": getManifestResponse.digest,
+      ...manifestCacheHeaders(getManifestResponse.digest),
     },
   });
 });
@@ -360,14 +373,43 @@ v2Router.get("/:name+/referrers/:digest", async (req, env: Env) => {
 
 v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionContext) => {
   const { name, digest } = req.params;
+  const request = req as unknown as Request;
+
+  // Blobs are content-addressed by sha256 digest in the path. The URL alone
+  // is a safe cache key — same URL across callers must return the same
+  // bytes, so we can serve any caller from any other caller's edge entry.
+  //
+  // On a cache hit, still honour If-None-Match: the cached entry necessarily
+  // has the URL's digest as its ETag, so a matching If-None-Match collapses
+  // to 304 instead of streaming the cached body. Without this, a warm pull
+  // with the body already client-side would still incur the egress.
+  const cached = await tryServeFromEdgeCache(request);
+  if (cached) {
+    const notModified = maybeNotModified(request, digest, blobCacheHeaders);
+    if (notModified) return notModified;
+    return cached;
+  }
+
   const res = await env.REGISTRY_CLIENT.getLayer(name, digest);
   if (!("response" in res)) {
-    return new Response(res.stream, {
-      headers: {
-        "Docker-Content-Digest": res.digest,
-        "Content-Length": `${res.size}`,
-      },
-    });
+    // 304 is only correct after we've confirmed the blob exists; otherwise
+    // a request for a non-existent digest with `If-None-Match: "<that-digest>"`
+    // would short-circuit to 304 when the spec-correct answer is 404.
+    const notModified = maybeNotModified(request, res.digest, blobCacheHeaders);
+    if (notModified) return notModified;
+
+    // tee the stream: one branch back to the client, one into the edge cache
+    // (the cache write must consume the body, so we can't share the same
+    // stream). populateEdgeCache skips entries above the per-entry size cap.
+    const [s1, s2] = res.stream.tee();
+    const headers = {
+      "Docker-Content-Digest": res.digest,
+      "Content-Length": `${res.size}`,
+      ...blobCacheHeaders(res.digest),
+    };
+    const cacheResponse = new Response(s2, { headers });
+    populateEdgeCache(request, cacheResponse, res.size, context);
+    return new Response(s1, { headers });
   }
 
   let layerResponse: GetLayerResponse | null = null;
@@ -400,12 +442,17 @@ v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionCo
 
   if (layerResponse === null) return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
 
-  return new Response(layerResponse.stream, {
-    headers: {
-      "Docker-Content-Digest": layerResponse.digest,
-      "Content-Length": `${layerResponse.size}`,
-    },
-  });
+  // Seed the edge cache from the fallback-registry success path too — without
+  // this, every repeat pull of the same digest re-traverses the upstream
+  // until the asynchronous monolithicUpload above lands in R2.
+  const [clientStream, cacheStream] = layerResponse.stream.tee();
+  const headers = {
+    "Docker-Content-Digest": layerResponse.digest,
+    "Content-Length": `${layerResponse.size}`,
+    ...blobCacheHeaders(layerResponse.digest),
+  };
+  populateEdgeCache(request, new Response(cacheStream, { headers }), layerResponse.size, context);
+  return new Response(clientStream, { headers });
 });
 
 v2Router.delete("/:name+/blobs/uploads/:id", async (req, env: Env) => {
@@ -621,10 +668,21 @@ v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
     };
   }
 
+  // Honour If-None-Match on HEAD too: now that existence is confirmed, a
+  // matching ETag collapses to 304 (per RFC 7232) so warm `docker pull`
+  // probes that send `If-None-Match: "<digest>"` don't even need the small
+  // metadata response. R2 `head()` is already cheap, so this is purely a
+  // client-bandwidth optimisation, not a cache-amplification one — that's
+  // why we deliberately skip a cache lookup here (the cached entry is a
+  // GET response with a body, which a HEAD response must not include).
+  const notModified = maybeNotModified(req as unknown as Request, layerExistsResponse.digest, blobCacheHeaders);
+  if (notModified) return notModified;
+
   return new Response(null, {
     headers: {
       "Content-Length": layerExistsResponse.size.toString(),
       "Docker-Content-Digest": layerExistsResponse.digest,
+      ...blobCacheHeaders(layerExistsResponse.digest),
     },
   });
 });
