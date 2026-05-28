@@ -17,6 +17,13 @@ export interface Env {
   REGISTRY: R2Bucket;
   ENVIRONMENT: string;
   JWT_REGISTRY_TOKENS_PUBLIC_KEY?: string;
+  /**
+   * Optional KV namespace acting as a deny-list of revoked JWT IDs. When
+   * bound, the JWT auth path rejects any presented token whose `jti` claim
+   * is a key in this namespace. Tokens without `jti` cannot be revoked
+   * out-of-band; rely on natural `exp` expiry instead.
+   */
+  JWT_REGISTRY_TOKENS_DENY_LIST?: KVNamespace;
   USERNAME?: string;
   PASSWORD?: string;
   READONLY_USERNAME?: string;

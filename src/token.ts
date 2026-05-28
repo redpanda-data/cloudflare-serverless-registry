@@ -14,17 +14,19 @@ export function importKeyFromBase64(key: string): JsonWebKeyWithKid {
   return JSON.parse(decode(key)) as JsonWebKeyWithKid;
 }
 
-export async function newRegistryTokens(jwtPublicKey: string): Promise<RegistryTokens> {
-  return new RegistryTokens(importKeyFromBase64(jwtPublicKey));
+export async function newRegistryTokens(jwtPublicKey: string, denyListKV?: KVNamespace): Promise<RegistryTokens> {
+  return new RegistryTokens(importKeyFromBase64(jwtPublicKey), denyListKV);
 }
 
 export class RegistryTokens implements Authenticator {
   private jwtPublicKey: JsonWebKeyWithKid;
+  private denyListKV?: KVNamespace;
   authmode: string;
 
-  constructor(jwtPublicKey: JsonWebKeyWithKid) {
+  constructor(jwtPublicKey: JsonWebKeyWithKid, denyListKV?: KVNamespace) {
     this.authmode = "RegistryTokens";
     this.jwtPublicKey = jwtPublicKey;
+    this.denyListKV = denyListKV;
   }
 
   /**
@@ -97,7 +99,32 @@ export class RegistryTokens implements Authenticator {
       // the JWT signature is valid, decode it now
       const decoded = jwt.decode(token);
       const payload = decoded.payload as RegistryAuthProtocolTokenPayload;
-      return RegistryTokens.verifyPayload(request, payload);
+
+      // Run the payload check (exp, capabilities, scope) before consulting
+      // the deny-list KV. Expired or capability-mismatched tokens would be
+      // rejected anyway; doing the KV read for them is a wasted hop on the
+      // hot path, and the KV path costs more than a same-isolate timestamp
+      // compare.
+      const payloadResult = RegistryTokens.verifyPayload(request, payload);
+      if (!payloadResult.verified) {
+        return payloadResult;
+      }
+
+      // Revocation check: if a deny-list KV is bound and the token carries
+      // a `jti`, reject when the JTI is present in the deny-list. Operators
+      // can set any KV value (we don't read it — presence == revoked) and
+      // optionally use the TTL on the KV entry to expire it automatically
+      // alongside the JWT's `exp`. Tokens without a `jti` cannot be revoked
+      // out-of-band and fall back to natural expiry only.
+      if (this.denyListKV && payload.jti) {
+        const revoked = await this.denyListKV.get(payload.jti, "text");
+        if (revoked !== null) {
+          console.warn(`verifyToken: jti ${payload.jti} is on the deny-list`);
+          return { verified: false, payload: null };
+        }
+      }
+
+      return payloadResult;
     } catch (error) {
       // If the verification fails (e.g., due to token expiration or signature mismatch),
       // jwt.verify() will throw an error which we can catch here.

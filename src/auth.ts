@@ -9,6 +9,11 @@ export type RegistryAuthProtocolTokenPayload = {
   exp: number;
   aud: string;
   iat?: number;
+  /**
+   * Optional JWT ID. When set, the registry can check `jti` against a
+   * deny-list KV namespace and reject revoked tokens before expiry.
+   */
+  jti?: string;
 };
 
 export type AuthenticatorCheckCredentialsResponse = {
