@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { SHA256_PREFIX_LEN, getSHA256 } from "../src/user";
 import { TagsList } from "../src/router";
 import { Env } from "..";
-import { RegistryTokens } from "../src/token";
+import { RegistryTokens, parseJwtAlgorithm, DEFAULT_JWT_ALGORITHM, SUPPORTED_JWT_ALGORITHMS } from "../src/token";
 import { RegistryAuthProtocolTokenPayload } from "../src/auth";
 import { registries } from "../src/registry/registry";
 import type { ReferrerDescriptor } from "../src/registry/registry";
@@ -1383,6 +1383,70 @@ describe("tokens", async () => {
     expect(verified).toBeTruthy();
   });
 
+  describe("parseJwtAlgorithm", () => {
+    test("undefined falls back to ES256 default", () => {
+      expect(parseJwtAlgorithm(undefined)).toEqual(DEFAULT_JWT_ALGORITHM);
+      expect(DEFAULT_JWT_ALGORITHM).toEqual("ES256");
+    });
+
+    test("empty string falls back to ES256 default", () => {
+      expect(parseJwtAlgorithm("")).toEqual("ES256");
+    });
+
+    test("accepts every documented asymmetric algorithm", () => {
+      for (const alg of SUPPORTED_JWT_ALGORITHMS) {
+        expect(parseJwtAlgorithm(alg)).toEqual(alg);
+      }
+    });
+
+    test("rejects unsupported values with a descriptive message", () => {
+      expect(() => parseJwtAlgorithm("HS256")).toThrow(/HS256/);
+      expect(() => parseJwtAlgorithm("none")).toThrow(/none/);
+      expect(() => parseJwtAlgorithm("ES256 ")).toThrow();
+      expect(() => parseJwtAlgorithm("PS256")).toThrow();
+    });
+
+    test("RS256 end-to-end: token signed with RS256 verifies under RS256 config", async () => {
+      const jwt = (await import("@tsndr/cloudflare-worker-jwt")).default;
+      // Generate an RSA-2048 keypair the way an RS256 issuer would (matches the
+      // Phase 0a `tls_private_key.rp_registry_bearer_signer` shape).
+      const keyPair = (await crypto.subtle.generateKey(
+        { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+        true,
+        ["sign", "verify"],
+      )) as CryptoKeyPair;
+      const privateJwk = (await crypto.subtle.exportKey("jwk", keyPair.privateKey)) as JsonWebKeyWithKid;
+      const publicJwk = (await crypto.subtle.exportKey("jwk", keyPair.publicKey)) as JsonWebKeyWithKid;
+
+      const tokens = new RegistryTokens(publicJwk, "RS256");
+      const token = await jwt.sign(
+        {
+          username: "v0",
+          account_id: "rs256-acct",
+          capabilities: ["pull"],
+          aud: "https://reg.test/",
+          exp: Math.floor(Date.now() / 1000) + 60,
+        },
+        privateJwk,
+        { algorithm: "RS256" },
+      );
+
+      const ok = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(ok.verified).toBe(true);
+
+      // Negative: an ES256-configured verifier rejects an RS256-signed token,
+      // proving the algorithm parameter actually drives the signature check
+      // (not just the labelled `alg` header in the JWT).
+      const [, esPub] = await RegistryTokens.createPrivateAndPublicKey();
+      const esTokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(esPub)) as JsonWebKeyWithKid,
+        "ES256",
+      );
+      const wrong = await esTokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(wrong.verified).toBe(false);
+    });
+  });
+
   describe("revocation deny-list KV", () => {
     // Minimal in-memory stand-in for a KVNamespace. Only `get` is exercised
     // by the revocation hook; the other methods are present so the type
@@ -1428,6 +1492,7 @@ describe("tokens", async () => {
       const kv = makeKv({ "revoked-jti": "1" });
       const tokens = new RegistryTokens(
         JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        DEFAULT_JWT_ALGORITHM,
         kv,
       );
       const token = await signedToken(priv, { jti: "revoked-jti" });
@@ -1440,6 +1505,7 @@ describe("tokens", async () => {
       const kv = makeKv({ "other-jti": "1" });
       const tokens = new RegistryTokens(
         JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        DEFAULT_JWT_ALGORITHM,
         kv,
       );
       const token = await signedToken(priv, { jti: "fresh-jti" });
@@ -1452,6 +1518,7 @@ describe("tokens", async () => {
       const kv = makeKv({ "some-jti": "1" });
       const tokens = new RegistryTokens(
         JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        DEFAULT_JWT_ALGORITHM,
         kv,
       );
       const token = await signedToken(priv); // no jti
@@ -1461,9 +1528,9 @@ describe("tokens", async () => {
 
     test("no deny-list binding skips revocation lookup entirely", async () => {
       const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      // Omit both algorithm and kv to also exercise the default-arg path.
       const tokens = new RegistryTokens(
         JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
-        // no kv argument
       );
       const token = await signedToken(priv, { jti: "whatever" });
       const r = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);

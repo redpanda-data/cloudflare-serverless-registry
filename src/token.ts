@@ -14,18 +14,45 @@ export function importKeyFromBase64(key: string): JsonWebKeyWithKid {
   return JSON.parse(decode(key)) as JsonWebKeyWithKid;
 }
 
-export async function newRegistryTokens(jwtPublicKey: string, denyListKV?: KVNamespace): Promise<RegistryTokens> {
-  return new RegistryTokens(importKeyFromBase64(jwtPublicKey), denyListKV);
+// Algorithms accepted by `@tsndr/cloudflare-worker-jwt` that produce signatures
+// supported by `crypto.subtle` in Workers. Keep this list narrow so the env
+// variable can't enable HMAC modes by mistake (an HMAC public key is the
+// signing key — a misconfiguration there is a silent auth bypass).
+export const SUPPORTED_JWT_ALGORITHMS = ["ES256", "ES384", "ES512", "RS256", "RS384", "RS512"] as const;
+export type JwtAlgorithm = (typeof SUPPORTED_JWT_ALGORITHMS)[number];
+
+export const DEFAULT_JWT_ALGORITHM: JwtAlgorithm = "ES256";
+
+export function parseJwtAlgorithm(value: string | undefined): JwtAlgorithm {
+  if (value === undefined || value === "") return DEFAULT_JWT_ALGORITHM;
+  if ((SUPPORTED_JWT_ALGORITHMS as readonly string[]).includes(value)) return value as JwtAlgorithm;
+  throw new Error(
+    `unsupported JWT_REGISTRY_TOKENS_ALGORITHM "${value}"; expected one of ${SUPPORTED_JWT_ALGORITHMS.join(", ")}`,
+  );
+}
+
+export async function newRegistryTokens(
+  jwtPublicKey: string,
+  algorithm: JwtAlgorithm = DEFAULT_JWT_ALGORITHM,
+  denyListKV?: KVNamespace,
+): Promise<RegistryTokens> {
+  return new RegistryTokens(importKeyFromBase64(jwtPublicKey), algorithm, denyListKV);
 }
 
 export class RegistryTokens implements Authenticator {
   private jwtPublicKey: JsonWebKeyWithKid;
+  private algorithm: JwtAlgorithm;
   private denyListKV?: KVNamespace;
   authmode: string;
 
-  constructor(jwtPublicKey: JsonWebKeyWithKid, denyListKV?: KVNamespace) {
+  constructor(
+    jwtPublicKey: JsonWebKeyWithKid,
+    algorithm: JwtAlgorithm = DEFAULT_JWT_ALGORITHM,
+    denyListKV?: KVNamespace,
+  ) {
     this.authmode = "RegistryTokens";
     this.jwtPublicKey = jwtPublicKey;
+    this.algorithm = algorithm;
     this.denyListKV = denyListKV;
   }
 
@@ -72,7 +99,7 @@ export class RegistryTokens implements Authenticator {
     };
 
     const token = await jwt.sign(tokenPayload, privateKey, {
-      algorithm: "ES256",
+      algorithm: this.algorithm,
     });
 
     return token;
@@ -91,7 +118,7 @@ export class RegistryTokens implements Authenticator {
   }> {
     try {
       // first verify the JWT
-      if (!(await jwt.verify(token, this.jwtPublicKey, { algorithm: "ES256" }))) {
+      if (!(await jwt.verify(token, this.jwtPublicKey, { algorithm: this.algorithm }))) {
         console.warn("verifyToken: jwt.verify() failed");
         return { verified: false, payload: null };
       }
