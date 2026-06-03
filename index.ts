@@ -18,6 +18,11 @@ export interface Env {
   ENVIRONMENT: string;
   JWT_REGISTRY_TOKENS_PUBLIC_KEY?: string;
   /**
+   * JWT signing algorithm to verify against `JWT_REGISTRY_TOKENS_PUBLIC_KEY`.
+   * Accepts ES256 (default, back-compat), ES384, ES512, RS256, RS384, RS512.
+   */
+  JWT_REGISTRY_TOKENS_ALGORITHM?: string;
+  /**
    * Optional KV namespace acting as a deny-list of revoked JWT IDs. When
    * bound, the JWT auth path rejects any presented token whose `jti` claim
    * is a key in this namespace. Tokens without `jti` cannot be revoked
