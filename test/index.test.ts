@@ -344,8 +344,110 @@ describe("v2 manifests", () => {
       "content-length": "2",
       "content-type": "application/gzip",
       "docker-content-digest": sha256,
+      // Cache-Control + ETag added on manifest responses so Cloudflare's edge
+      // (and any conformant HTTP client cache) can revalidate by digest.
+      "cache-control": "public, max-age=60",
+      "etag": `"${sha256}"`,
     });
     await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
+  });
+
+  test("GET /v2/:name/manifests/:reference sets Cache-Control + ETag", async () => {
+    const reference = "manifest-cache";
+    const name = "name";
+    const data = "{}";
+    const sha256 = await getSHA256(data);
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/manifests/${reference}`, data, {
+      httpMetadata: { contentType: "application/gzip" },
+      sha256: sha256.slice(SHA256_PREFIX_LEN),
+    });
+    const res = await fetch(createRequest("GET", `/v2/${name}/manifests/${reference}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("cache-control")).toEqual("public, max-age=60");
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    expect(res.headers.get("docker-content-digest")).toEqual(sha256);
+    await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
+  });
+
+  test("GET /v2/:name/manifests/:reference returns 304 when If-None-Match matches digest", async () => {
+    const reference = "manifest-cond";
+    const name = "name";
+    const data = "{}";
+    const sha256 = await getSHA256(data);
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/manifests/${reference}`, data, {
+      httpMetadata: { contentType: "application/gzip" },
+      sha256: sha256.slice(SHA256_PREFIX_LEN),
+    });
+    const req = createRequest("GET", `/v2/${name}/manifests/${reference}`, null);
+    req.headers.set("If-None-Match", `"${sha256}"`);
+    const res = await fetch(req);
+    expect(res.status).toEqual(304);
+    expect(res.headers.get("cache-control")).toEqual("public, max-age=60");
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    await bindings.REGISTRY.delete(`${name}/manifests/${reference}`);
+  });
+
+  test("GET /v2/:name/blobs/:digest sets immutable Cache-Control + ETag", async () => {
+    const name = "blobcache";
+    const data = "hello-blob";
+    const sha256 = await getSHA256(data);
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/blobs/${sha256}`, data, {
+      sha256: sha256.slice(SHA256_PREFIX_LEN),
+    });
+    const res = await fetch(createRequest("GET", `/v2/${name}/blobs/${sha256}`, null));
+    expect(res.ok).toBeTruthy();
+    expect(res.headers.get("cache-control")).toEqual("public, max-age=31536000, immutable");
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    expect(res.headers.get("docker-content-digest")).toEqual(sha256);
+    await bindings.REGISTRY.delete(`${name}/blobs/${sha256}`);
+  });
+
+  test("GET /v2/:name/blobs/:digest returns 304 when If-None-Match matches AND blob exists", async () => {
+    const name = "blobcond";
+    const data = "conditional";
+    const sha256 = await getSHA256(data);
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/blobs/${sha256}`, data, {
+      sha256: sha256.slice(SHA256_PREFIX_LEN),
+    });
+    const req = createRequest("GET", `/v2/${name}/blobs/${sha256}`, null);
+    req.headers.set("If-None-Match", `"${sha256}"`);
+    const res = await fetch(req);
+    expect(res.status).toEqual(304);
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    await bindings.REGISTRY.delete(`${name}/blobs/${sha256}`);
+  });
+
+  test("GET /v2/:name/blobs/:digest returns 404 (not 304) when blob is missing even with If-None-Match", async () => {
+    // Per RFC 7232: 304 is only valid when the resource exists. The naive
+    // implementation (compare URL digest to If-None-Match before existence
+    // check) trivially returns 304 because URL digest == itself. The router
+    // must defer the conditional check until after R2 confirms existence.
+    const name = "blobcond";
+    const fakeDigest = "sha256:" + "0".repeat(64);
+    const req = createRequest("GET", `/v2/${name}/blobs/${fakeDigest}`, null);
+    req.headers.set("If-None-Match", `"${fakeDigest}"`);
+    const res = await fetch(req);
+    expect(res.status).toEqual(404);
+  });
+
+  test("HEAD /v2/:name/blobs/:tag returns 304 when If-None-Match matches digest", async () => {
+    const name = "blobheadcond";
+    const data = "head-conditional";
+    const sha256 = await getSHA256(data);
+    const bindings = env as Env;
+    await bindings.REGISTRY.put(`${name}/blobs/${sha256}`, data, {
+      sha256: sha256.slice(SHA256_PREFIX_LEN),
+    });
+    const req = createRequest("HEAD", `/v2/${name}/blobs/${sha256}`, null);
+    req.headers.set("If-None-Match", `"${sha256}"`);
+    const res = await fetch(req);
+    expect(res.status).toEqual(304);
+    expect(res.headers.get("etag")).toEqual(`"${sha256}"`);
+    await bindings.REGISTRY.delete(`${name}/blobs/${sha256}`);
   });
 
   test("PUT then DELETE /v2/:name/manifests/:reference works", async () => {
