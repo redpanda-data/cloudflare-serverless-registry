@@ -121,7 +121,13 @@ for (const layer of manifest.Layers) {
       // This handles both cases.
       const layerName = layer.endsWith(".tar") ? path.dirname(layer) : path.basename(layer);
 
-      const layerCachePath = path.join(cacheFolder, layerName + "-ptr");
+      // The pointer-file suffix encodes the cache scheme version. Bumping it
+      // self-invalidates entries from older versions of this tool — e.g. the
+      // pre-PR-#6 cache held double-gzipped blob digests under "-ptr", and a
+      // re-run would have happily re-pushed them. New schemes go under a new
+      // suffix so old pointer files are simply ignored and the layer is
+      // recomputed once.
+      const layerCachePath = path.join(cacheFolder, layerName + "-ptr-v2");
       {
         const layerCacheGzip = file(layerCachePath);
         if (await layerCacheGzip.exists()) {
@@ -131,7 +137,53 @@ for (const layer of manifest.Layers) {
       }
 
       const inprogressPath = path.join(cacheFolder, layerName + "-in-progress");
-      await rm(inprogressPath, { recursive: true });
+      await rm(inprogressPath, { recursive: true, force: true });
+
+      // Newer Docker daemons (since the OCI image layout became the default
+      // `docker save` output) write each layer pre-compressed at
+      // `blobs/sha256/<digest>`. Older daemons write plain tar at
+      // `<digest>/layer.tar`. Detect which by sniffing the first two bytes
+      // for the gzip magic (`1f 8b`); if pre-compressed, copy through
+      // byte-for-byte and use the file's existing sha256 digest. Re-gzipping
+      // it would produce a double-gzipped blob — the registry serves the
+      // bytes faithfully but pull-time tar extraction fails with
+      // "archive/tar: invalid tar header".
+      const head = new Uint8Array(await file(layerPath).slice(0, 2).arrayBuffer());
+      const alreadyGzipped = head.length >= 2 && head[0] === 0x1f && head[1] === 0x8b;
+      if (alreadyGzipped) {
+        const hasher = new Bun.CryptoHasher("sha256");
+        const cacheWriter = file(inprogressPath).writer();
+        // Bound the in-memory write buffer for multi-hundred-MB layers by
+        // flushing every PASSTHROUGH_FLUSH_BYTES. Without this the Bun
+        // FileSink accumulates the entire layer in memory before draining
+        // (Bun's `write()` doesn't expose synchronous backpressure the way
+        // a Node stream does); for a 600 MB layer the process would peak
+        // at ~600 MB resident — fine on a workstation but unfriendly to
+        // smaller CI runners. 16 MiB is a balance between syscall cost
+        // and bounded RSS.
+        const PASSTHROUGH_FLUSH_BYTES = 16 * 1024 * 1024;
+        let bytesSinceFlush = 0;
+        await file(layerPath)
+          .stream()
+          .pipeTo(
+            new WritableStream({
+              async write(value: Uint8Array) {
+                hasher.update(value);
+                cacheWriter.write(value);
+                bytesSinceFlush += value.byteLength;
+                if (bytesSinceFlush >= PASSTHROUGH_FLUSH_BYTES) {
+                  await cacheWriter.flush();
+                  bytesSinceFlush = 0;
+                }
+              },
+            }),
+          );
+        await cacheWriter.end();
+        const digest = hasher.digest("hex");
+        await rename(inprogressPath, path.join(cacheFolder, digest));
+        await write(layerCachePath, digest);
+        return digest;
+      }
 
       const hasher = new Bun.CryptoHasher("sha256");
       const cacheWriter = file(inprogressPath).writer();
