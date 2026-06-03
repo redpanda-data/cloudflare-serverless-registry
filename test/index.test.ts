@@ -1280,6 +1280,94 @@ describe("tokens", async () => {
     } as RegistryAuthProtocolTokenPayload);
     expect(verified).toBeTruthy();
   });
+
+  describe("revocation deny-list KV", () => {
+    // Minimal in-memory stand-in for a KVNamespace. Only `get` is exercised
+    // by the revocation hook; the other methods are present so the type
+    // checks pass.
+    function makeKv(initial: Record<string, string> = {}): KVNamespace {
+      const store = new Map<string, string>(Object.entries(initial));
+      const kv = {
+        get: async (key: string) => (store.has(key) ? store.get(key)! : null),
+        put: async (key: string, value: string) => {
+          store.set(key, value);
+        },
+        delete: async (key: string) => {
+          store.delete(key);
+        },
+        list: async () => ({ keys: [...store.keys()].map((name) => ({ name })), list_complete: true, cursor: "" }),
+        getWithMetadata: async () => ({ value: null, metadata: null, cacheStatus: null }),
+      };
+      return kv as unknown as KVNamespace;
+    }
+
+    async function signedToken(privateKey: string, payload: Partial<RegistryAuthProtocolTokenPayload> = {}) {
+      // Sign a token directly so the test can attach `jti` (createToken's
+      // payload shape doesn't expose it).
+      const jwt = (await import("@tsndr/cloudflare-worker-jwt")).default;
+      const { decode } = await import("@cfworker/base64url");
+      const jwk = JSON.parse(decode(privateKey)) as JsonWebKeyWithKid;
+      return jwt.sign(
+        {
+          username: "v0",
+          account_id: "test-acct",
+          capabilities: ["pull"],
+          aud: "https://reg.test/",
+          exp: Math.floor(Date.now() / 1000) + 60,
+          ...payload,
+        },
+        jwk,
+        { algorithm: "ES256" },
+      );
+    }
+
+    test("matching jti in deny-list rejects the token", async () => {
+      const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      const kv = makeKv({ "revoked-jti": "1" });
+      const tokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        kv,
+      );
+      const token = await signedToken(priv, { jti: "revoked-jti" });
+      const r = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(r.verified).toBe(false);
+    });
+
+    test("non-matching jti is accepted", async () => {
+      const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      const kv = makeKv({ "other-jti": "1" });
+      const tokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        kv,
+      );
+      const token = await signedToken(priv, { jti: "fresh-jti" });
+      const r = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(r.verified).toBe(true);
+    });
+
+    test("token without jti is accepted even with deny-list bound (no revocation possible)", async () => {
+      const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      const kv = makeKv({ "some-jti": "1" });
+      const tokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        kv,
+      );
+      const token = await signedToken(priv); // no jti
+      const r = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(r.verified).toBe(true);
+    });
+
+    test("no deny-list binding skips revocation lookup entirely", async () => {
+      const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      const tokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+        // no kv argument
+      );
+      const token = await signedToken(priv, { jti: "whatever" });
+      const r = await tokens.verifyToken(createRequest("GET", "/v2/repo/manifests/latest", null), token);
+      expect(r.verified).toBe(true);
+    });
+  });
 });
 
 test("registries configuration", async () => {

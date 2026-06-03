@@ -5,7 +5,7 @@ import type { AuthenticatorCredentials } from "./user";
 
 export async function authenticationMethodFromEnv(env: Env) {
   if (env.JWT_REGISTRY_TOKENS_PUBLIC_KEY) {
-    return await newRegistryTokens(env.JWT_REGISTRY_TOKENS_PUBLIC_KEY);
+    return await newRegistryTokens(env.JWT_REGISTRY_TOKENS_PUBLIC_KEY, env.JWT_REGISTRY_TOKENS_DENY_LIST);
   } else if ((env.USERNAME && env.PASSWORD) || (env.READONLY_USERNAME && env.READONLY_PASSWORD)) {
     const credentials: AuthenticatorCredentials[] = [];
 
