@@ -1537,6 +1537,97 @@ describe("tokens", async () => {
       expect(r.verified).toBe(true);
     });
   });
+
+  describe("scope claim", () => {
+    test("matching repo + action grants access", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/cloudv2/oxla/manifests/v1", null), {
+        capabilities: ["pull"],
+        scope: "repository:cloudv2/oxla:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeTruthy();
+    });
+
+    test("mismatched repo denies access", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/cloudv2/oxla/manifests/v1", null), {
+        capabilities: ["pull"],
+        scope: "repository:other/repo:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+    });
+
+    test("missing action denies access", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("PUT", "/v2/cloudv2/oxla/manifests/v1", null), {
+        capabilities: ["push"],
+        scope: "repository:cloudv2/oxla:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+    });
+
+    test("wildcard action grants any action on the matching repo", () => {
+      for (const method of ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]) {
+        const { verified } = RegistryTokens.verifyPayload(
+          createRequest(method, "/v2/cloudv2/oxla/manifests/v1", null),
+          {
+            capabilities: ["pull", "push"],
+            scope: "repository:cloudv2/oxla:*",
+          } as RegistryAuthProtocolTokenPayload,
+        );
+        expect(verified, `method=${method}`).toBeTruthy();
+      }
+    });
+
+    test("multiple scope tokens, space-separated", () => {
+      // Matches the second token.
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/cloudv2/oxla/manifests/v1", null), {
+        capabilities: ["pull"],
+        scope: "repository:other/repo:pull repository:cloudv2/oxla:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeTruthy();
+    });
+
+    test("scope as array of strings", () => {
+      const { verified } = RegistryTokens.verifyPayload(
+        createRequest("GET", "/v2/cloudv2/oxla/blobs/sha256:abc", null),
+        {
+          capabilities: ["pull"],
+          scope: ["repository:other/repo:push", "repository:cloudv2/oxla:pull"],
+        } as RegistryAuthProtocolTokenPayload,
+      );
+      expect(verified).toBeTruthy();
+    });
+
+    test("empty / malformed scope fails closed", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/cloudv2/oxla/manifests/v1", null), {
+        capabilities: ["pull"],
+        scope: "garbage",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+    });
+
+    test("non-repository paths bypass scope check (capabilities still gate)", () => {
+      // /v2/ ping has no repository name; with no scope-applicable repo, the
+      // scope check is skipped and the capability check runs alone.
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/", null), {
+        capabilities: ["pull"],
+        scope: "repository:cloudv2/oxla:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeTruthy();
+    });
+
+    test("/gc endpoint is repository-scoped (security: token for repo A cannot GC repo B)", () => {
+      const wrongRepo = RegistryTokens.verifyPayload(createRequest("POST", "/v2/cloudv2/oxla/gc", null), {
+        capabilities: ["push"],
+        scope: "repository:other/repo:*",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(wrongRepo.verified).toBeFalsy();
+
+      const correctRepo = RegistryTokens.verifyPayload(createRequest("POST", "/v2/cloudv2/oxla/gc", null), {
+        capabilities: ["push"],
+        scope: "repository:cloudv2/oxla:*",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(correctRepo.verified).toBeTruthy();
+    });
+  });
 });
 
 test("registries configuration", async () => {

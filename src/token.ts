@@ -5,6 +5,9 @@ import {
   RegistryAuthProtocolTokenPayload,
   stripUsernamePasswordFromHeader,
   Authenticator,
+  actionForMethod,
+  parseScopeClaim,
+  repositoryNameFromUrl,
 } from "./auth";
 
 export function importKeyFromBase64(key: string): JsonWebKeyWithKid {
@@ -170,6 +173,36 @@ export class RegistryTokens implements Authenticator {
       // The token has expired
       console.warn(`verifyV0Token: failed jwt verification: the token has expired`);
       return { verified: false, payload: null };
+    }
+
+    // Optional fine-grained scope check (Docker Registry token-scope syntax).
+    // If the JWT carries a `scope` claim, the request's repository name AND
+    // the action implied by the HTTP method must be authorised by at least
+    // one scope token. This runs IN ADDITION to the `capabilities` check
+    // below — both must pass — so a misconfigured issuer can't widen access
+    // by emitting an over-broad scope.
+    if (payload.scope !== undefined) {
+      const scopes = parseScopeClaim(payload.scope);
+      if (scopes.length === 0) {
+        console.warn("verifyToken: scope claim present but produced zero parsed scopes");
+        return { verified: false, payload: null };
+      }
+      const repo = repositoryNameFromUrl(request.url);
+      const action = actionForMethod(request.method);
+      // No repo (e.g. /v2/ ping, /v2/_catalog) is allowed under scope — the
+      // capability check below still gates these paths.
+      if (repo !== null && action !== null) {
+        // The Docker token-scope syntax allows "*" as an actions wildcard
+        // (e.g. `repository:foo:*` == any action on foo). Treat it the same
+        // as the requested action being present in `actions`.
+        const allowed = scopes.some(
+          (s) => s.type === "repository" && s.name === repo && (s.actions.includes(action) || s.actions.includes("*")),
+        );
+        if (!allowed) {
+          console.warn(`verifyToken: scope claim does not authorise ${action} on repository ${repo}`);
+          return { verified: false, payload: null };
+        }
+      }
     }
 
     // ensure capabilities are satisfied
