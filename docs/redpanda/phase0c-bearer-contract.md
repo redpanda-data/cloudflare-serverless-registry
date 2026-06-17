@@ -41,6 +41,16 @@ Jira: [DEVPROD-4150](https://redpandadata.atlassian.net/browse/DEVPROD-4150) (Ph
                        └────────────────────────────────────┘
 ```
 
+## Incoming cluster JWT (auth Worker input)
+
+What the auth Worker expects on the cluster JWT it receives at `/token` (the control-plane-signed credential, _not_ this Bearer). Authoritative source: the DP artifact-migration RFC (its §JWT design section — not an IETF RFC) and cloudv2 `pkg/clusterjwt`; summarized here so the auth and registry sides live in one doc.
+
+- **Transport:** presented as `Authorization: Bearer <jwt>` **or** `Authorization: Basic <base64(username:<jwt>)>` — Docker sends imagePullSecret credentials as Basic to the token realm, so the JWT arrives as the password (the username is ignored).
+- **`iss`:** `redpanda-cloud-controlplane` (exact match).
+- **`aud`:** `https://auth.pkg.redpanda.com/` — the auth Worker is the recipient; the cluster JWT never reaches the registry. Distinct from this Bearer's `aud` (`https://registry.pkg.redpanda.com/`).
+- **Signature:** RS256, verified against the CP JWKS the Worker serves from KV at `https://auth.pkg.redpanda.com/.well-known/jwks.json` (key selected by the JWT's `kid` = the KMS key id).
+- **Scope inputs:** `sub` (`cluster:<id>` / `ci:<name>`), `env`, `allowed_repos`, `capabilities` — the Worker authorizes the requested scope against these, then copies `sub` / `account_id` / `capabilities` / `scope` onto the Bearer below.
+
 ## Signing
 
 |                                   |                                                                                                                                                 |
