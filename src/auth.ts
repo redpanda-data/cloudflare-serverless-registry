@@ -1,5 +1,4 @@
-import { decode } from "@cfworker/base64url";
-import { errorString } from "./utils";
+import { decodeBase64Loose, errorString } from "./utils";
 
 export type RegistryTokenCapability = "push" | "pull";
 export type RegistryAuthProtocolTokenPayload = {
@@ -67,9 +66,56 @@ export function parseScopeClaim(scope: string | string[] | undefined): ParsedSco
 }
 
 /**
+ * Per-request store for the verified token payload, keyed by the Request object
+ * (which is unique per request). Handlers need the payload to authorise
+ * operations whose target repository isn't in the URL path (the cross-repo
+ * mount `from` source). We deliberately DON'T stash it on `env`: the bindings
+ * object is shared across concurrent requests in an isolate, so mutating it
+ * risks bleeding one request's auth context into another — a correctness and
+ * (since it drives an authz decision) security hazard. A WeakMap keyed by the
+ * request is request-scoped and garbage-collected automatically.
+ */
+const requestAuthPayloads = new WeakMap<Request, RegistryAuthProtocolTokenPayload>();
+
+export function setRequestAuthPayload(request: Request, payload: RegistryAuthProtocolTokenPayload | null): void {
+  if (payload) requestAuthPayloads.set(request, payload);
+}
+
+export function getRequestAuthPayload(request: Request): RegistryAuthProtocolTokenPayload | undefined {
+  return requestAuthPayloads.get(request);
+}
+
+/**
+ * Does this token's `scope` claim authorise `action` on `repo`? A token with no
+ * `scope` claim is treated as unrestricted (single-tenant USERNAME/PASSWORD or
+ * a no-scope JWT deploy); a token that DOES carry a scope claim must name the
+ * repository and an authorising action (or the `*` wildcard). Used to gate
+ * operations whose target repository isn't the request URL path — notably the
+ * cross-repository blob mount `from` source.
+ */
+export function scopeAuthorizes(
+  payload: RegistryAuthProtocolTokenPayload | null | undefined,
+  repo: string,
+  action: string,
+): boolean {
+  // Deny by default when there is no payload: a missing auth context must never
+  // silently authorize. Callers that intentionally allow unauthenticated /
+  // unscoped access (e.g. single-credential deploys) decide that explicitly.
+  if (!payload) return false;
+  // A present token with NO scope claim is unrestricted (single-credential or a
+  // no-scope JWT deploy that has no per-repo notion).
+  if (payload.scope === undefined) return true;
+  return parseScopeClaim(payload.scope).some(
+    (s) => s.type === "repository" && s.name === repo && (s.actions.includes(action) || s.actions.includes("*")),
+  );
+}
+
+/**
  * Extract the OCI repository name from a v2 request URL. Returns null for
- * non-repository endpoints (like /v2/ or /v2/_catalog) — those bypass the
- * scope check and rely on capabilities-only gating in `verifyPayload`.
+ * non-repository endpoints (like /v2/ or /v2/_catalog). For a token that
+ * carries a `scope` claim, `verifyPayload` allows only the `/v2/` version
+ * probe among these and fails closed on the rest (e.g. /v2/_catalog); a token
+ * with no scope claim falls back to capabilities-only gating.
  *
  * The list of boundary segments must cover EVERY repository-scoped route the
  * router exposes; otherwise a missing entry becomes a scope-bypass bug
@@ -135,6 +181,29 @@ export interface Authenticator {
   checkCredentials(r: Request): Promise<AuthenticatorCheckCredentialsResponse>;
 }
 
+/**
+ * Extract a Bearer token from the Authorization header, or null if the request
+ * doesn't use the Bearer scheme. Used by the JWT authenticator so standard OCI
+ * clients can present `Authorization: Bearer <registry-jwt>` after the Docker
+ * Registry v2 token-auth exchange, in addition to the legacy Basic-password
+ * form. The token is verified by the same `verifyToken` path as the Basic
+ * password JWT.
+ */
+export function bearerTokenFromHeader(r: Request): string | null {
+  const authorization = r.headers.get("Authorization") ?? "";
+  // Per RFC 7235 the auth scheme is case-insensitive and any amount of
+  // whitespace may separate it from the credentials, so match loosely rather
+  // than splitting on a single space — some OCI clients/proxies emit
+  // `bearer <token>` or pad with extra spaces.
+  // The Bearer credential is a single non-whitespace token (RFC 6750 b64token).
+  // Capturing `\S+` (rather than `.*?`) rejects a value with embedded spaces or
+  // trailing junk like "Bearer <jwt> extra" instead of passing a malformed
+  // token downstream.
+  const match = authorization.match(/^\s*Bearer\s+(\S+)\s*$/i);
+  if (!match) return null;
+  return match[1];
+}
+
 export function stripUsernamePasswordFromHeader(r: Request): [string, string] | { verified: false; payload: null } {
   // first check if we have an Authorization header, this is the basis for all auth stuff in our registry
   const authorization = r.headers.get("Authorization") ?? "";
@@ -145,18 +214,24 @@ export function stripUsernamePasswordFromHeader(r: Request): [string, string] | 
     return { verified: false, payload: null };
   }
 
-  // now check the Authorization scheme used in the request
-  const [scheme, encoded] = authorization.split(" ");
-
-  // we strictly assume that auth scheme can only be Basic
-  if (!encoded || scheme !== "Basic") {
+  // Match the Basic scheme case-insensitively with whitespace tolerance per
+  // RFC 7235 (the scheme is case-insensitive and any amount of whitespace may
+  // separate it from the credentials); a strict `split(" ")` + exact-case
+  // check rejects valid headers from some clients/proxies. The base64 token
+  // itself contains no whitespace.
+  const match = authorization.match(/^\s*Basic\s+(\S+)\s*$/i);
+  if (!match) {
     console.warn("failed checkCredentials: Authorization doesn't include Basic scheme");
     return { verified: false, payload: null };
   }
+  const encoded = match[1];
 
   try {
-    // Decodes the base64 value and performs unicode normalization.
-    const decoded = decode(encoded);
+    // RFC 7617 Basic credentials are STANDARD base64 (may contain `+` and `/`),
+    // so decode with `atob` — a base64url decoder rejects those characters and
+    // would drop otherwise-valid headers. `atob` yields one byte per char;
+    // re-decode as UTF-8 so multi-byte usernames survive.
+    const decoded = new TextDecoder().decode(Uint8Array.from(decodeBase64Loose(encoded), (ch) => ch.charCodeAt(0)));
 
     // The username & password are split by the first colon.
     //=> example: "username:password"
