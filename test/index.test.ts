@@ -3,7 +3,14 @@ import { SHA256_PREFIX_LEN, getSHA256 } from "../src/user";
 import { TagsList } from "../src/router";
 import { Env } from "..";
 import { RegistryTokens, parseJwtAlgorithm, DEFAULT_JWT_ALGORITHM, SUPPORTED_JWT_ALGORITHMS } from "../src/token";
-import { RegistryAuthProtocolTokenPayload } from "../src/auth";
+import {
+  RegistryAuthProtocolTokenPayload,
+  bearerTokenFromHeader,
+  stripUsernamePasswordFromHeader,
+  scopeAuthorizes,
+} from "../src/auth";
+import { decodeBase64Loose } from "../src/utils";
+import { AuthErrorResponse } from "../src/errors";
 import { registries } from "../src/registry/registry";
 import type { ReferrerDescriptor } from "../src/registry/registry";
 import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
@@ -1604,6 +1611,57 @@ describe("tokens", async () => {
       expect(verified).toBeFalsy();
     });
 
+    test("empty scope claim is valid on the /v2/ version probe (docker login)", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/", null), {
+        capabilities: ["pull"],
+        scope: "",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeTruthy();
+    });
+
+    test("empty scope claim cannot read a repository (no cross-tenant access)", () => {
+      // A login-probe / empty-intersect token must not reach any repository,
+      // even though it carries a pull/push capability.
+      for (const method of ["GET", "HEAD", "PUT", "POST"]) {
+        const { verified } = RegistryTokens.verifyPayload(
+          createRequest(method, "/v2/cloudv2/other-tenant/manifests/v1", null),
+          {
+            capabilities: ["pull", "push"],
+            scope: "",
+          } as RegistryAuthProtocolTokenPayload,
+        );
+        expect(verified, `method=${method}`).toBeFalsy();
+      }
+    });
+
+    test("empty scope claim cannot list the catalog", () => {
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/_catalog", null), {
+        capabilities: ["pull"],
+        scope: "",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+    });
+
+    test("a repo-scoped token cannot list the catalog (no cross-tenant enumeration)", () => {
+      // A token scoped to one repository must not enumerate the whole bucket
+      // via /v2/_catalog, even with a non-empty scope + pull capability.
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", "/v2/_catalog", null), {
+        capabilities: ["pull"],
+        scope: "repository:cloudv2/oxla:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+    });
+
+    test("empty scope is valid on /v2 probe variants (no trailing slash / query string)", () => {
+      for (const path of ["/v2/", "/v2", "/v2/?n=1"]) {
+        const { verified } = RegistryTokens.verifyPayload(createRequest("GET", path, null), {
+          capabilities: ["pull"],
+          scope: "",
+        } as RegistryAuthProtocolTokenPayload);
+        expect(verified, `path=${path}`).toBeTruthy();
+      }
+    });
+
     test("non-repository paths bypass scope check (capabilities still gate)", () => {
       // /v2/ ping has no repository name; with no scope-applicable repo, the
       // scope check is skipped and the capability check runs alone.
@@ -1626,6 +1684,201 @@ describe("tokens", async () => {
         scope: "repository:cloudv2/oxla:*",
       } as RegistryAuthProtocolTokenPayload);
       expect(correctRepo.verified).toBeTruthy();
+    });
+  });
+});
+
+describe("docker v2 bearer token-auth", () => {
+  describe("WWW-Authenticate challenge", () => {
+    test("no token realm falls back to Basic", () => {
+      const res = new AuthErrorResponse(createRequest("GET", "/v2/", null));
+      expect(res.status).toBe(401);
+      expect(res.headers.get("WWW-Authenticate")).toBe(`Basic realm="https://registry.com/v2/"`);
+    });
+
+    test("token realm + /v2/ ping emits Bearer challenge with no scope", () => {
+      const res = new AuthErrorResponse(createRequest("GET", "/v2/", null), "https://auth.test/token");
+      expect(res.headers.get("WWW-Authenticate")).toBe(`Bearer realm="https://auth.test/token",service="registry.com"`);
+    });
+
+    test("service omits an explicit port (matches the portless auth-server service id)", () => {
+      const res = new AuthErrorResponse(
+        new Request("https://registry.com:8443/v2/", { method: "GET" }),
+        "https://auth.test/token",
+      );
+      expect(res.headers.get("WWW-Authenticate")).toBe(`Bearer realm="https://auth.test/token",service="registry.com"`);
+    });
+
+    test("token realm + repo path emits per-operation scope (pull for GET)", () => {
+      const res = new AuthErrorResponse(
+        createRequest("GET", "/v2/cloudv2/oxla/manifests/v1", null),
+        "https://auth.test/token",
+      );
+      expect(res.headers.get("WWW-Authenticate")).toBe(
+        `Bearer realm="https://auth.test/token",service="registry.com",scope="repository:cloudv2/oxla:pull"`,
+      );
+    });
+
+    test("push methods request the push action", () => {
+      const res = new AuthErrorResponse(
+        createRequest("PUT", "/v2/cloudv2/oxla/manifests/v1", null),
+        "https://auth.test/token",
+      );
+      expect(res.headers.get("WWW-Authenticate")).toContain(`scope="repository:cloudv2/oxla:push"`);
+    });
+
+    test("a malformed token realm falls back to Basic instead of breaking auth", () => {
+      // Control chars / non-URL values would corrupt the header or throw; the
+      // 401 must still be emittable (degrade to Basic) rather than 500.
+      for (const bad of [
+        "not a url",
+        'https://evil/"injected',
+        "https://h/\r\nX-Evil: 1",
+        "ftp-no-scheme",
+        "ftp://auth.test/token", // valid URL but a scheme OCI clients won't follow
+        "https://exämple.test/token", // IDN/Unicode host: not header-safe as-is
+        "https://auth.test/a b", // embedded space
+        "https:token", // no `//` authority — not a usable token endpoint
+        "https://user:pass@auth.test/token", // embedded userinfo would leak
+      ]) {
+        const res = new AuthErrorResponse(createRequest("GET", "/v2/", null), bad);
+        expect(res.status).toBe(401);
+        expect(res.headers.get("WWW-Authenticate"), `realm=${JSON.stringify(bad)}`).toMatch(/^Basic realm=/);
+      }
+    });
+  });
+
+  describe("bearerTokenFromHeader", () => {
+    test("extracts the token from a Bearer header", () => {
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Bearer abc.def.ghi" }))).toBe(
+        "abc.def.ghi",
+      );
+    });
+
+    test("returns null for Basic and missing headers", () => {
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Basic dXNlcjpwYXNz" }))).toBe(
+        null,
+      );
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null))).toBe(null);
+    });
+
+    test("tolerates extra whitespace and case-insensitive scheme (RFC 7235)", () => {
+      // Some OCI clients/proxies pad with extra spaces or lowercase the scheme.
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Bearer   abc.def.ghi" }))).toBe(
+        "abc.def.ghi",
+      );
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "bearer abc.def.ghi" }))).toBe(
+        "abc.def.ghi",
+      );
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Bearer \tabc " }))).toBe("abc");
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Bearer " }))).toBe(null);
+    });
+
+    test("rejects a credential with embedded whitespace / trailing junk", () => {
+      // RFC 6750 b64token is a single non-whitespace run; "Bearer <jwt> extra"
+      // must not be accepted as the token "<jwt> extra".
+      expect(bearerTokenFromHeader(createRequest("GET", "/v2/", null, { Authorization: "Bearer abc def" }))).toBe(null);
+    });
+  });
+
+  describe("Basic header parsing is RFC 7235 / 7617 tolerant", () => {
+    // RFC 7617 Basic uses STANDARD base64 (btoa), which may contain `+` / `/`.
+    const creds = btoa("user:pass");
+    test("accepts lowercase scheme and extra whitespace", () => {
+      for (const hdr of [`Basic ${creds}`, `basic ${creds}`, `Basic    ${creds}`, `  Basic ${creds}  `]) {
+        const res = stripUsernamePasswordFromHeader(createRequest("GET", "/v2/", null, { Authorization: hdr }));
+        expect(Array.isArray(res), `hdr=${JSON.stringify(hdr)}`).toBe(true);
+        expect((res as [string, string])[0]).toBe("user");
+        expect((res as [string, string])[1]).toBe("pass");
+      }
+    });
+
+    test("decodes standard-base64 credentials containing + or /", () => {
+      // btoa("user:>>>") === "dXNlcjo+Pj4=" — contains `+`, which a base64url
+      // decoder rejects. Proves the Basic path uses a standard-base64 decoder.
+      const password = ">>>";
+      const encoded = btoa(`user:${password}`);
+      expect(encoded).toMatch(/[+/]/);
+      const res = stripUsernamePasswordFromHeader(
+        createRequest("GET", "/v2/", null, { Authorization: `Basic ${encoded}` }),
+      );
+      expect(Array.isArray(res)).toBe(true);
+      expect((res as [string, string])[0]).toBe("user");
+      expect((res as [string, string])[1]).toBe(password);
+    });
+
+    test("rejects a non-Basic scheme", () => {
+      const res = stripUsernamePasswordFromHeader(
+        createRequest("GET", "/v2/", null, { Authorization: `Token ${creds}` }),
+      );
+      expect(Array.isArray(res)).toBe(false);
+    });
+  });
+
+  describe("decodeBase64Loose accepts standard and url-safe base64", () => {
+    test("decodes standard base64 with + and /", () => {
+      const s = btoa("user:>>>"); // contains '+'
+      expect(s).toMatch(/[+/]/);
+      expect(decodeBase64Loose(s)).toBe("user:>>>");
+    });
+
+    test("decodes url-safe base64, padded or not", () => {
+      // Build a value whose standard base64 has + and /, then url-safe it and
+      // strip padding — atob alone would reject this.
+      const std = btoa("\xff\xef\xfe?"); // -> contains + and /
+      const urlsafe = std.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      expect(urlsafe).toMatch(/[-_]/);
+      expect(decodeBase64Loose(urlsafe)).toBe("\xff\xef\xfe?");
+    });
+  });
+
+  describe("scopeAuthorizes gates the cross-repo mount source", () => {
+    const scoped = {
+      capabilities: ["pull", "push"],
+      scope: "repository:cloudv2/a:pull,push",
+    } as RegistryAuthProtocolTokenPayload;
+    test("allows an action the scope names", () => {
+      expect(scopeAuthorizes(scoped, "cloudv2/a", "pull")).toBe(true);
+    });
+    test("denies a repository the scope does not name (cross-tenant mount source)", () => {
+      expect(scopeAuthorizes(scoped, "cloudv2/other-tenant", "pull")).toBe(false);
+    });
+    test("a token with no scope claim is unrestricted (single-tenant deploys)", () => {
+      expect(scopeAuthorizes({ capabilities: ["pull"] } as RegistryAuthProtocolTokenPayload, "any/repo", "pull")).toBe(
+        true,
+      );
+    });
+    test("an empty scope claim authorises nothing", () => {
+      expect(
+        scopeAuthorizes({ capabilities: ["pull"], scope: "" } as RegistryAuthProtocolTokenPayload, "x/y", "pull"),
+      ).toBe(false);
+    });
+  });
+
+  describe("checkCredentials accepts the Bearer scheme", () => {
+    async function tokensWithKey(): Promise<{ tokens: RegistryTokens; token: string }> {
+      const [priv, pub] = await RegistryTokens.createPrivateAndPublicKey();
+      const tokens = new RegistryTokens(
+        JSON.parse((await import("@cfworker/base64url")).decode(pub)) as JsonWebKeyWithKid,
+      );
+      const token = await tokens.createToken("acct", ["pull"], 5, priv, "https://reg.test/");
+      return { tokens, token };
+    }
+
+    test("Authorization: Bearer <jwt> verifies via the same path as Basic", async () => {
+      const { tokens, token } = await tokensWithKey();
+      const r = await tokens.checkCredentials(
+        createRequest("GET", "/v2/repo/manifests/latest", null, { Authorization: `Bearer ${token}` }),
+      );
+      expect(r.verified).toBe(true);
+    });
+
+    test("legacy Basic-password JWT still verifies (back-compat)", async () => {
+      const { tokens, token } = await tokensWithKey();
+      const r = await tokens.checkCredentials(
+        createRequest("GET", "/v2/repo/manifests/latest", null, { Authorization: `Basic ${btoa("v0:" + token)}` }),
+      );
+      expect(r.verified).toBe(true);
     });
   });
 });

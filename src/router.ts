@@ -3,6 +3,7 @@ import { BlobUnknownError, ManifestUnknownError } from "./v2-errors";
 import { InternalError, ServerError } from "./errors";
 import { errorString, jsonHeaders, wrap } from "./utils";
 import { hexToDigest, isValidDigest } from "./user";
+import { getRequestAuthPayload, scopeAuthorizes } from "./auth";
 import { ManifestTagsListTooBigError } from "./v2-responses";
 import { Env } from "..";
 import { MINIMUM_CHUNK, MAXIMUM_CHUNK, MAXIMUM_CHUNK_UPLOAD_SIZE } from "./chunk";
@@ -475,20 +476,46 @@ v2Router.post("/:name+/blobs/uploads/", async (req, env: Env) => {
   const { name } = req.params;
   const { from, mount } = req.query;
   if (mount !== undefined && from !== undefined) {
-    // Try to create a new upload from an existing layer on another repository
-    const [finishedUploadObject, err] = await wrap<FinishedUploadObject | RegistryError, Error>(
-      env.REGISTRY_CLIENT.mountExistingLayer(from.toString(), mount.toString(), name),
-    );
-    // If there is an error, fallback to the default layer upload system
-    if (!(err || (finishedUploadObject && "response" in finishedUploadObject))) {
-      return new Response(null, {
-        status: 201,
-        headers: {
-          "Content-Length": "0",
-          "Location": finishedUploadObject.location,
-          "Docker-Content-Digest": finishedUploadObject.digest,
-        },
-      });
+    // OCI cross-repository blob mount: only attempt the mount when the caller is
+    // authorised to PULL from the source repo — both via the token's `scope`
+    // (the per-repo signal) AND its coarse `pull` capability. The generic auth
+    // check only sees the destination (the URL path `name`) and only requires
+    // `push` for this POST, so without this a token scoped/capable to push its
+    // own repo could mount — and thereby copy — layers out of any other
+    // tenant's repository (cross-tenant blob exfiltration). When unauthorised we
+    // skip the optimization and fall through to a normal upload.
+    const fromName = from.toString();
+    // Cast to the global `Request` to match how this file already adapts
+    // itty-router's request type elsewhere; the cast is type-only, so `req` is
+    // still the same object the auth middleware keyed the payload by.
+    const authPayload = getRequestAuthPayload(req as unknown as Request);
+    // When JWT (per-repo scope) auth is configured, a mount MUST be backed by a
+    // token that authorises pull on the source — fail CLOSED if the payload is
+    // somehow absent rather than silently allowing a cross-tenant mount. In
+    // single-credential (USERNAME/PASSWORD) mode there is no per-repo scoping,
+    // so the global credential may mount from any source.
+    const jwtAuthMode = !!env.JWT_REGISTRY_TOKENS_PUBLIC_KEY;
+    const mayPullSource = jwtAuthMode
+      ? authPayload != null &&
+        scopeAuthorizes(authPayload, fromName, "pull") &&
+        authPayload.capabilities.includes("pull")
+      : true;
+    if (mayPullSource) {
+      // Try to create a new upload from an existing layer on another repository
+      const [finishedUploadObject, err] = await wrap<FinishedUploadObject | RegistryError, Error>(
+        env.REGISTRY_CLIENT.mountExistingLayer(fromName, mount.toString(), name),
+      );
+      // If there is an error, fallback to the default layer upload system
+      if (!(err || (finishedUploadObject && "response" in finishedUploadObject))) {
+        return new Response(null, {
+          status: 201,
+          headers: {
+            "Content-Length": "0",
+            "Location": finishedUploadObject.location,
+            "Docker-Content-Digest": finishedUploadObject.digest,
+          },
+        });
+      }
     }
   }
   // Upload a new layer
