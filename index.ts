@@ -8,6 +8,7 @@ import v2Router from "./src/router";
 import { authenticationMethodFromEnv } from "./src/authentication-method";
 import { Registry } from "./src/registry/registry";
 import { R2Registry } from "./src/registry/r2";
+import { setRequestAuthPayload } from "./src/auth";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
@@ -29,6 +30,12 @@ export interface Env {
    * out-of-band; rely on natural `exp` expiry instead.
    */
   JWT_REGISTRY_TOKENS_DENY_LIST?: KVNamespace;
+  /**
+   * Token endpoint URL advertised in the `WWW-Authenticate: Bearer realm=...`
+   * 401 challenge. When set, the registry speaks the Docker Registry v2
+   * token-auth flow; when unset, it falls back to a Basic challenge.
+   */
+  REGISTRY_TOKEN_REALM?: string;
   USERNAME?: string;
   PASSWORD?: string;
   READONLY_USERNAME?: string;
@@ -50,6 +57,9 @@ router.all("*", () => new Response("Not Found.", { status: 404 }));
 export default {
   async fetch(request: Request, env: Env, context?: ExecutionContext) {
     if (!ensureConfig(env)) {
+      // Storage prerequisite missing (the R2 bucket binding). Challenge with
+      // Basic rather than Bearer — we can't service a token-auth flow without
+      // a configured registry backend.
       return new AuthErrorResponse(request);
     }
 
@@ -58,12 +68,21 @@ export default {
       return new AuthErrorResponse(request);
     }
 
+    // Only advertise the Bearer token-auth flow when the JWT authenticator is
+    // actually active. In USERNAME/PASSWORD (Basic) mode — or if JWT auth was
+    // disabled (e.g. invalid algorithm) — the registry cannot satisfy a Bearer
+    // challenge, so it must keep challenging with Basic.
+    const tokenRealm = authMethod.authmode === "RegistryTokens" ? env.REGISTRY_TOKEN_REALM : undefined;
+
     const credentials = await authMethod.checkCredentials(request);
     if (!credentials.verified) {
       console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
-      return new AuthErrorResponse(request);
+      return new AuthErrorResponse(request, tokenRealm);
     }
 
+    // Stash the verified payload request-scoped (NOT on the shared `env`) for
+    // handlers that authorise non-URL-path repositories (cross-repo mount).
+    setRequestAuthPayload(request, credentials.payload ?? null);
     env.REGISTRY_CLIENT = new R2Registry(env);
     try {
       // Dispatch the request to the appropriate route

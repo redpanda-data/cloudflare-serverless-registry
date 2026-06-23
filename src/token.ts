@@ -1,9 +1,10 @@
-import { decode } from "@cfworker/base64url";
 import jwt from "@tsndr/cloudflare-worker-jwt";
+import { decodeBase64Loose } from "./utils";
 import {
   RegistryTokenCapability,
   RegistryAuthProtocolTokenPayload,
   stripUsernamePasswordFromHeader,
+  bearerTokenFromHeader,
   Authenticator,
   actionForMethod,
   parseScopeClaim,
@@ -11,10 +12,13 @@ import {
 } from "./auth";
 
 export function importKeyFromBase64(key: string): JsonWebKeyWithKid {
-  // Decodes the base64 value and performs unicode normalization.
+  // The key is a STANDARD base64-encoded JWK (e.g. produced by Python's
+  // base64.b64encode, which uses `+`/`/`), so decode with `atob` — a base64url
+  // decoder rejects those characters and could fail to load a valid key. The
+  // JWK JSON is ASCII, so the one-byte-per-char `atob` result parses directly.
   // The library's `JsonWebKeyWithKid` type requires `kid`, but ES256/HS256 sign
   // and verify only need the key material at runtime, so casting is safe.
-  return JSON.parse(decode(key)) as JsonWebKeyWithKid;
+  return JSON.parse(decodeBase64Loose(key)) as JsonWebKeyWithKid;
 }
 
 // Algorithms accepted by `@tsndr/cloudflare-worker-jwt` that produce signatures
@@ -109,7 +113,16 @@ export class RegistryTokens implements Authenticator {
   }
 
   static checkIfV2OnlyPath(request: Request): boolean {
-    return request.url.endsWith("/v2/");
+    let pathname: string;
+    try {
+      pathname = new URL(request.url).pathname;
+    } catch {
+      return false;
+    }
+    // Tolerate a query string and an optional trailing slash so a `/v2` or
+    // `/v2/?...` probe is still recognised as the version endpoint (the
+    // bare `endsWith("/v2/")` check missed both).
+    return pathname === "/v2/" || pathname === "/v2";
   }
 
   async verifyToken(
@@ -183,18 +196,30 @@ export class RegistryTokens implements Authenticator {
     // by emitting an over-broad scope.
     if (payload.scope !== undefined) {
       const scopes = parseScopeClaim(payload.scope);
-      if (scopes.length === 0) {
-        console.warn("verifyToken: scope claim present but produced zero parsed scopes");
-        return { verified: false, payload: null };
-      }
       const repo = repositoryNameFromUrl(request.url);
       const action = actionForMethod(request.method);
-      // No repo (e.g. /v2/ ping, /v2/_catalog) is allowed under scope — the
-      // capability check below still gates these paths.
-      if (repo !== null && action !== null) {
+      // A token that carries a `scope` claim is confined to (a) the `/v2/`
+      // version probe and (b) the repositories its scope names. There is no
+      // `allowed_repos` notion on the registry side, so the scope claim is the
+      // only per-repository authorization signal — anything outside it must
+      // fail closed.
+      if (RegistryTokens.checkIfV2OnlyPath(request)) {
+        // Version probe carries no repository; fall through to the capability
+        // check below. This is what `docker login` hits (with an empty-scope
+        // token minted for a no-scope request).
+      } else if (repo === null) {
+        // A non-repository endpoint that is not the version probe — notably
+        // `/v2/_catalog`, which enumerates the whole R2 bucket. A scope-claimed
+        // token must not reach it, or a token scoped to one repository could
+        // list every tenant's repositories (cross-tenant disclosure).
+        console.warn("verifyToken: scope-claimed token may not access non-repository endpoint");
+        return { verified: false, payload: null };
+      } else if (action !== null) {
         // The Docker token-scope syntax allows "*" as an actions wildcard
         // (e.g. `repository:foo:*` == any action on foo). Treat it the same
-        // as the requested action being present in `actions`.
+        // as the requested action being present in `actions`. An empty scope
+        // (login-probe token) parses to zero scopes and therefore matches no
+        // repository — failing closed here.
         const allowed = scopes.some(
           (s) => s.type === "repository" && s.name === repo && (s.actions.includes(action) || s.actions.includes("*")),
         );
@@ -259,6 +284,14 @@ export class RegistryTokens implements Authenticator {
     verified: boolean;
     payload: RegistryAuthProtocolTokenPayload | null;
   }> {
+    // Docker Registry v2 token-auth: the client presents the scoped registry
+    // JWT as `Authorization: Bearer <token>`. Verify it through the same path
+    // as the Basic-password JWT.
+    const bearer = bearerTokenFromHeader(request);
+    if (bearer !== null) {
+      return this.verifyToken(request, bearer);
+    }
+
     const res = stripUsernamePasswordFromHeader(request);
     if ("verified" in res) {
       return res;

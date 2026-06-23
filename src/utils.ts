@@ -1,5 +1,24 @@
 import { prettifyError, ZodError } from "zod";
 
+/**
+ * Decode base64 that may be either standard (`+`/`/`) or URL-safe (`-`/`_`),
+ * with or without `=` padding, into a one-byte-per-char binary string. `atob`
+ * only accepts standard, correctly-padded base64, so normalize first — this
+ * accepts both alphabets (RFC 7617 Basic credentials use standard base64;
+ * some JWK / token encodings are URL-safe and unpadded). Throws on
+ * structurally invalid input (callers are expected to try/catch).
+ */
+export function decodeBase64Loose(input: string): string {
+  // Strip all ASCII whitespace first: base64 itself never contains whitespace,
+  // but values from env vars / CLI secrets / PEM-style wrapping often carry
+  // trailing newlines or line breaks that would otherwise make `atob` throw.
+  const normalized = input.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  const remainder = normalized.length % 4;
+  if (remainder === 1) throw new Error("invalid base64 length");
+  const padded = remainder === 0 ? normalized : normalized + "=".repeat(4 - remainder);
+  return atob(padded);
+}
+
 export async function readableToBlob(
   reader: ReadableStreamDefaultReader,
   ...multiwriters: WritableStreamDefaultWriter[]
