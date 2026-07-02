@@ -7,7 +7,7 @@
   "scripts": {
     "deploy": "wrangler deploy --minify --env production",
     "dev:miniflare": "wrangler dev --env dev --port 9999 --live-reload",
-    "generate-types": "wrangler types --config test/wrangler.test.toml --include-env=false",
+    "generate-types": "wrangler types --config test/wrangler.test.jsonc --include-env=false",
     "typecheck": "pnpm run generate-types && tsc --noEmit && tsc --noEmit --project test/tsconfig.json && tsc --noEmit --project push/tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -29,7 +29,7 @@
     "prettier": "3.8.3",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.3",
-    "vite": "^8.0.12",
+    "vite": "^8.0.16",
     "vitest": "^4.1.6",
     "wrangler": "^4.90.1"
   },
@@ -37,5 +37,6 @@
     "node": ">=24.0.0",
     "pnpm": ">=11.0.0"
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@11.5.2"
 }
