@@ -19,7 +19,19 @@ echo $PASSWORD | USERNAME_REGISTRY=<your-configured-username> bun run index.ts $
 ## How does it work
 
 It exports the image using `docker save`, then pushes each layer to the registry.
-It only supports `Basic` authentication as it's the one that serverless-registry uses.
+
+Authentication starts as HTTP Basic (`Authorization: Basic base64(<username>:<password>)`). If the registry challenges a
+request with `WWW-Authenticate: Bearer realm="...",service="..."` (Docker Registry v2
+token-auth — this is what `registry.pkg.redpanda.com` does), the tool exchanges that
+Basic credential for a scoped Bearer token at the challenge's realm and uses `Bearer`
+for every request after, refreshing the token proactively before it expires. Against
+registries that never send a Bearer challenge (e.g. the local `INSECURE_HTTP_PUSH`
+prototype), it just keeps using Basic — no behavior change there.
+
+For `registry.pkg.redpanda.com`, the username is always the literal `v0` and the
+password is a cluster JWT minted via `go run ./tools/scripts/registry-auth mint ...`
+from a `cloudv2` checkout (see that repo for the full command) — the username is
+ignored by the registry, only the JWT-as-password matters.
 
 It's able to chunk layers depending on the header `oci-chunk-max-length` returned by the registry when the client
 creates an upload.

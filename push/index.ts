@@ -260,21 +260,17 @@ const tag =
 
 import fetchNode from "node-fetch";
 import { ReadableLimiter } from "./limiter";
+import { TokenAuth, authorizedFetch } from "./auth";
 
-const cred = `Basic ${btoa(`${username}:${password}`)}`;
+const repo = imageRepositoryPath.replace(/^\//, "");
+const auth = new TokenAuth(username, password, `repository:${repo}:pull,push`);
 
 console.log("Starting push to remote");
 // pushLayer accepts the target digest, the stream to read from, and the total layer size.
 // It will do the entire push process by itself.
 async function pushLayer(layerDigest: string, readableStream: ReadableStream, totalLayerSize: number) {
-  const headers = new Headers({
-    authorization: cred,
-  });
   const layerExistsURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/${layerDigest}`;
-  const layerExistsResponse = await fetch(layerExistsURL, {
-    headers,
-    method: "HEAD",
-  });
+  const layerExistsResponse = await authorizedFetch(auth, layerExistsURL, { method: "HEAD" });
 
   if (!layerExistsResponse.ok && layerExistsResponse.status !== 404) {
     throw new Error(`${layerExistsURL} responded ${layerExistsResponse.status}: ${await layerExistsResponse.text()}`);
@@ -286,10 +282,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   }
 
   const createUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/blobs/uploads/`;
-  const createUploadResponse = await fetch(createUploadURL, {
-    headers,
-    method: "POST",
-  });
+  const createUploadResponse = await authorizedFetch(auth, createUploadURL, { method: "POST" });
   if (!createUploadResponse.ok) {
     throw new Error(
       `${createUploadURL} responded ${createUploadResponse.status}: ${await createUploadResponse.text()}`,
@@ -332,7 +325,7 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
       body: current,
       headers: new Headers({
         "range": range,
-        "authorization": cred,
+        "authorization": await auth.header(),
         "content-length": `${Math.min(totalLayerSizeLeft, maxToWrite)}`,
       }),
     });
@@ -358,12 +351,9 @@ async function pushLayer(layerDigest: string, readableStream: ReadableStream, to
   const range = `0-${written - 1}`;
   const uploadURL = new URL(parseLocation(location));
   uploadURL.searchParams.append("digest", layerDigest);
-  const response = await fetch(uploadURL.toString(), {
+  const response = await authorizedFetch(auth, uploadURL.toString(), {
     method: "PUT",
-    headers: new Headers({
-      Range: range,
-      Authorization: cred,
-    }),
+    headers: new Headers({ Range: range }),
   });
   if (!response.ok) {
     throw new Error(`${uploadURL.toString()} failed with ${response.status}: ${await response.text()}`);
@@ -439,11 +429,8 @@ const manifestObject = {
 } as const;
 
 const manifestUploadURL = `${proto}://${imageHost}/v2${imageRepositoryPath}/manifests/${tag}`;
-const responseManifestUpload = await fetch(manifestUploadURL, {
-  headers: {
-    "authorization": cred,
-    "content-type": manifestObject.mediaType,
-  },
+const responseManifestUpload = await authorizedFetch(auth, manifestUploadURL, {
+  headers: { "content-type": manifestObject.mediaType },
   body: JSON.stringify(manifestObject),
   method: "PUT",
 });
