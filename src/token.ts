@@ -196,7 +196,7 @@ export class RegistryTokens implements Authenticator {
     // by emitting an over-broad scope.
     if (payload.scope !== undefined) {
       const scopes = parseScopeClaim(payload.scope);
-      const repo = repositoryNameFromUrl(request.url);
+      const repo = repositoryNameFromUrl(request.url, request.method);
       const action = actionForMethod(request.method);
       // A token that carries a `scope` claim is confined to (a) the `/v2/`
       // version probe and (b) the repositories its scope names. There is no

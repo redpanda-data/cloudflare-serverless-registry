@@ -123,8 +123,32 @@ export function scopeAuthorizes(
  * if it carries the matching capability). The router exposes `/gc` as a
  * repository-scoped operation that is not part of the OCI Distribution
  * spec — keep it in this list.
+ *
+ * Each boundary is matched at its LAST occurrence, not its first, and the
+ * boundary TYPE chosen is whichever occurs latest overall -- not whichever
+ * type happens to be checked first: the router's `/:name+/<boundary>` routes
+ * compile to a greedy regex, so for a name containing an embedded boundary
+ * substring of any type (e.g. repository `foo/manifests/bar` on a
+ * `/:name+/blobs/:digest` route), the router's captured `name` extends up to
+ * the last occurrence of whichever literal tail the actual route uses, not
+ * the first occurrence of any boundary this function happens to check first.
+ * Using an earlier occurrence, or an earlier-checked type, here would
+ * authorize against a shorter, wrong repository name than the one the router
+ * actually dispatches to — a cross-repository scope bypass. Taking the
+ * overall-latest boundary can only make this function's result
+ * equal-or-longer than the router's true match (never shorter), so any
+ * residual imprecision fails closed (denies a legitimate request) rather
+ * than open.
+ *
+ * `/gc` is a bare 3-character boundary with no trailing separator (unlike
+ * the other four, which end in `/` or are long enough to be unambiguous), so
+ * it can match inside a spec-legal manifest tag that merely starts with
+ * "gc" (e.g. tag `gc-tag` on `GET /:name+/manifests/:reference`). The `/gc`
+ * route is POST-only (`v2Router.post("/:name+/gc", ...)`), so it is only
+ * considered a candidate boundary for POST requests -- for any other
+ * method it can never be the route the router actually dispatches to.
  */
-export function repositoryNameFromUrl(url: string): string | null {
+export function repositoryNameFromUrl(url: string, method: string): string | null {
   let pathname: string;
   try {
     pathname = new URL(url).pathname;
@@ -133,11 +157,23 @@ export function repositoryNameFromUrl(url: string): string | null {
   }
   if (!pathname.startsWith("/v2/")) return null;
   const rest = pathname.slice("/v2/".length);
-  const boundaries = ["/manifests/", "/blobs/", "/tags/list", "/referrers/", "/gc"];
+  const boundaries =
+    method.toUpperCase() === "POST"
+      ? ["/manifests/", "/blobs/", "/tags/list", "/referrers/", "/gc"]
+      : ["/manifests/", "/blobs/", "/tags/list", "/referrers/"];
+  // Check every boundary TYPE, not just the first one found: a repo name can
+  // contain one boundary substring (e.g. "/manifests/") while the request
+  // actually targets a different, later boundary (e.g. "/blobs/" for a blob
+  // digest further along the path). Picking the first boundary TYPE that
+  // matches at all -- rather than whichever boundary occurs LATEST in the
+  // path, regardless of type -- would return a shorter name than the router
+  // dispatches to.
+  let lastIdx = -1;
   for (const b of boundaries) {
-    const idx = rest.indexOf(b);
-    if (idx > 0) return rest.slice(0, idx);
+    const idx = rest.lastIndexOf(b);
+    if (idx > lastIdx) lastIdx = idx;
   }
+  if (lastIdx > 0) return rest.slice(0, lastIdx);
   return null;
 }
 
@@ -147,8 +183,8 @@ export function repositoryNameFromUrl(url: string): string | null {
  * truth source is `repositoryNameFromUrl`: anything it can extract a name
  * from is repository-scoped.
  */
-export function isRepositoryScopedRequest(url: string): boolean {
-  return repositoryNameFromUrl(url) !== null;
+export function isRepositoryScopedRequest(url: string, method: string): boolean {
+  return repositoryNameFromUrl(url, method) !== null;
 }
 
 /**
