@@ -6,9 +6,12 @@ import { Router } from "itty-router";
 import { AuthErrorResponse, InternalError } from "./src/errors";
 import v2Router from "./src/router";
 import { authenticationMethodFromEnv } from "./src/authentication-method";
+import { RegistryTokens } from "./src/token";
 import { Registry } from "./src/registry/registry";
 import { R2Registry } from "./src/registry/r2";
 import { setRequestAuthPayload } from "./src/auth";
+import { log } from "./src/log";
+import { safeErrorString } from "./src/utils";
 
 // A full compatibility mode means that the r2 registry will try its best to
 // help the client on the layer push. See how we let the client push layers with chunked uploads for more information.
@@ -16,6 +19,7 @@ type PushCompatibilityMode = "full" | "none";
 
 export interface Env {
   REGISTRY: R2Bucket;
+  METRICS?: AnalyticsEngineDataset;
   ENVIRONMENT: string;
   JWT_REGISTRY_TOKENS_PUBLIC_KEY?: string;
   /**
@@ -70,59 +74,113 @@ router.all("/v2/*", v2Router.fetch);
 
 router.all("*", () => new Response("Not Found.", { status: 404 }));
 
+function recordMetric(env: Env, outcome: string, status: number, durationMs: number): void {
+  // blobs[0] is a fixed "registry" source tag: the METRICS dataset is shared
+  // with the auth Worker (a separate deployable, instrumented in the
+  // companion devprod-infra plan), so the alerting Worker's queries group by
+  // this dimension to compute per-source error rates.
+  try {
+    env.METRICS?.writeDataPoint({
+      blobs: ["registry", outcome],
+      doubles: [durationMs],
+      indexes: [String(status)],
+    });
+  } catch (err) {
+    // Instrumentation is best-effort: a metrics write failure must never
+    // turn an otherwise-successful (or already-erroring) response into an
+    // unhandled 500 via the caller's outer catch.
+    log.error("metrics_write_failed", { error: safeErrorString(err) });
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, context?: ExecutionContext) {
-    if (!ensureConfig(env)) {
-      // Storage prerequisite missing (the R2 bucket binding). Challenge with
-      // Basic rather than Bearer — we can't service a token-auth flow without
-      // a configured registry backend.
-      return new AuthErrorResponse(request);
-    }
+    const start = Date.now();
+    const elapsed = () => Date.now() - start;
 
-    const authMethod = await authenticationMethodFromEnv(env);
-    if (!authMethod) {
-      return new AuthErrorResponse(request);
-    }
-
-    // Only advertise the Bearer token-auth flow when the JWT authenticator is
-    // actually active. In USERNAME/PASSWORD (Basic) mode — or if JWT auth was
-    // disabled (e.g. invalid algorithm) — the registry cannot satisfy a Bearer
-    // challenge, so it must keep challenging with Basic.
-    const tokenRealm = authMethod.authmode === "RegistryTokens" ? env.REGISTRY_TOKEN_REALM : undefined;
-
-    const credentials = await authMethod.checkCredentials(request);
-    if (!credentials.verified) {
-      console.warn(`Not Authorized. authmode=${authMethod.authmode}. verified=false`);
-      return new AuthErrorResponse(request, tokenRealm);
-    }
-
-    // Stash the verified payload request-scoped (NOT on the shared `env`) for
-    // handlers that authorise non-URL-path repositories (cross-repo mount).
-    setRequestAuthPayload(request, credentials.payload ?? null);
-    env.REGISTRY_CLIENT = new R2Registry(env);
     try {
+      if (!ensureConfig(env)) {
+        // Storage prerequisite missing (the R2 bucket binding). Challenge with
+        // Basic rather than Bearer — we can't service a token-auth flow without
+        // a configured registry backend.
+        recordMetric(env, "config_error", 401, elapsed());
+        return new AuthErrorResponse(request);
+      }
+
+      const authMethod = await authenticationMethodFromEnv(env);
+      if (!authMethod) {
+        recordMetric(env, "config_error", 401, elapsed());
+        return new AuthErrorResponse(request);
+      }
+
+      // Only advertise the Bearer token-auth flow when the JWT authenticator is
+      // actually active. In USERNAME/PASSWORD (Basic) mode — or if JWT auth was
+      // disabled (e.g. invalid algorithm) — the registry cannot satisfy a Bearer
+      // challenge, so it must keep challenging with Basic.
+      const tokenRealm = authMethod.authmode === "RegistryTokens" ? env.REGISTRY_TOKEN_REALM : undefined;
+
+      const credentials = await authMethod.checkCredentials(request);
+      if (!credentials.verified) {
+        // No Authorization header at all (matching src/auth.ts's own falsy
+        // convention in stripUsernamePasswordFromHeader/bearerTokenFromHeader)
+        // AND on the /v2 version-probe path specifically is the routine
+        // anonymous probe every OCI/Docker client sends before presenting
+        // real credentials — tagging it the same as a genuine denial would
+        // swamp the auth_denied outcome with expected traffic instead of
+        // real credential failures. An unauthenticated request to any other
+        // path (e.g. a manifest/blob route) is a real denial, not a probe.
+        const anonymous = !request.headers.get("Authorization") && RegistryTokens.checkIfV2OnlyPath(request);
+        const outcome = anonymous ? "anonymous_probe" : "auth_denied";
+        const path = new URL(request.url).pathname;
+        const method = request.method;
+        // anonymous_probe is expected, high-volume traffic (every OCI/Docker
+        // client's preflight); logging it at warn would swamp real denials
+        // in a warning stream. info keeps it visible without the noise.
+        if (anonymous) {
+          log.info(outcome, { authmode: authMethod.authmode, path, method });
+        } else {
+          log.warn(outcome, { authmode: authMethod.authmode, path, method });
+        }
+        recordMetric(env, outcome, 401, elapsed());
+        return new AuthErrorResponse(request, tokenRealm);
+      }
+
+      // Stash the verified payload request-scoped (NOT on the shared `env`) for
+      // handlers that authorise non-URL-path repositories (cross-repo mount).
+      setRequestAuthPayload(request, credentials.payload ?? null);
+      // A request-scoped copy, not a mutation of the shared `env` binding
+      // object: Workers can interleave concurrent requests within the same
+      // isolate across `await` points, and mutating `env.REGISTRY_CLIENT`
+      // directly would let one request's client leak into another's while
+      // both are in flight. R2Registry self-references env.REGISTRY_CLIENT
+      // (src/registry/r2.ts's cross-repo layer-mount resolution), so it must
+      // be constructed with — and assigned onto — this same fresh object,
+      // not the shared `env` it was built from.
+      const requestEnv: Env = { ...env };
+      requestEnv.REGISTRY_CLIENT = new R2Registry(requestEnv);
       // Dispatch the request to the appropriate route
-      const res = await router.fetch(request, env, context);
+      const res = await router.fetch(request, requestEnv, context);
+      // Derived from the actual status, not hardcoded: a route can return a
+      // non-2xx Response without throwing (404s, RangeErrors, the router's
+      // catch-all 404), and those must not be counted as "success". Checked
+      // against < 400 rather than res.ok (200-299 only): a 304 Not Modified
+      // from maybeNotModified() on a warm docker-pull cache hit is a
+      // legitimate, by-design outcome, not an error.
+      recordMetric(env, res.status < 400 ? "success" : "response_error", res.status, elapsed());
       return res;
     } catch (err) {
       if (err instanceof Response) {
-        console.warn(`${request.method} ${err.status} ${err.url}`);
+        log.warn("router_error_response", {
+          method: request.method,
+          status: err.status,
+          path: new URL(request.url).pathname,
+        });
+        recordMetric(env, "router_error", err.status, elapsed());
         return err;
       }
 
-      // Unexpected error
-      if (err instanceof Error) {
-        console.error(
-          "An error has been thrown by the router:\n",
-          `${err.name}: ${err.message}: ${err.cause}: ${err.stack}`,
-        );
-        return new InternalError();
-      }
-
-      console.error(
-        "An error has been thrown and is neither a Response or an Error, JSON.stringify() =",
-        JSON.stringify(err),
-      );
+      log.error("unhandled_error", { error: safeErrorString(err) });
+      recordMetric(env, "unhandled_error", 500, elapsed());
       return new InternalError();
     }
   },
@@ -130,9 +188,9 @@ export default {
 
 const ensureConfig = (env: Env): boolean => {
   if (!env.REGISTRY) {
-    console.error(
-      "env.REGISTRY is not setup. Please setup an R2 bucket and add the binding in your wrangler config file. Try 'npx wrangler --env production r2 bucket create r2-registry'",
-    );
+    log.error("missing_registry_binding", {
+      hint: "Setup an R2 bucket and add the binding in your wrangler config file. Try 'npx wrangler --env production r2 bucket create r2-registry'",
+    });
     return false;
   }
 
