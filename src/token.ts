@@ -1,5 +1,5 @@
 import jwt from "@tsndr/cloudflare-worker-jwt";
-import { decodeBase64Loose } from "./utils";
+import { decodeBase64Loose, safeErrorString } from "./utils";
 import {
   RegistryTokenCapability,
   RegistryAuthProtocolTokenPayload,
@@ -134,8 +134,18 @@ export class RegistryTokens implements Authenticator {
     payload: RegistryAuthProtocolTokenPayload | null;
   }> {
     try {
-      // first verify the JWT
-      if (!(await jwt.verify(token, this.jwtPublicKey, { algorithm: this.algorithm }))) {
+      // first verify the JWT. throwError: true so a rejection (bad
+      // signature, EXPIRED, NOT_YET_VALID) throws with a specific message
+      // instead of silently returning falsy — otherwise every one of those
+      // distinct causes collapses into the same generic "verify failed",
+      // and since the library's own now > exp check almost always rejects
+      // before this call returns, an aged token would get logged as if its
+      // signature were invalid instead of merely expired. Still check the
+      // boolean return too (belt-and-suspenders): if a future version of
+      // this pinned dependency ever silently ignores throwError, a falsy
+      // return must not fall through to decoding an unverified token.
+      const verified = await jwt.verify(token, this.jwtPublicKey, { algorithm: this.algorithm, throwError: true });
+      if (!verified) {
         log.warn("jwt_verify_failed", { reason: "signature_invalid" });
         return { verified: false, payload: null };
       }
@@ -175,7 +185,7 @@ export class RegistryTokens implements Authenticator {
 
       // We could throw this error further up to allow more specific error handling,
       // or simply return {verified: false, payload: null  }to indicate token verification failure.
-      log.warn("jwt_verify_error", { message: (error as Error).message });
+      log.warn("jwt_verify_error", { error: safeErrorString(error) });
       return { verified: false, payload: null };
     }
   }
@@ -213,7 +223,7 @@ export class RegistryTokens implements Authenticator {
         // `/v2/_catalog`, which enumerates the whole R2 bucket. A scope-claimed
         // token must not reach it, or a token scoped to one repository could
         // list every tenant's repositories (cross-tenant disclosure).
-        log.warn("scope_denied_non_repository_endpoint", { url: request.url });
+        log.warn("scope_denied_non_repository_endpoint", { path: new URL(request.url).pathname });
         return { verified: false, payload: null };
       } else if (action !== null) {
         // The Docker token-scope syntax allows "*" as an actions wildcard
@@ -237,14 +247,22 @@ export class RegistryTokens implements Authenticator {
       case "HEAD":
         // HEAD requests can be used by pushers like docker
         if (!payload.capabilities.includes("pull") && !payload.capabilities.includes("push")) {
-          log.warn("jwt_capability_denied", { method: request.method, url: request.url, reason: "missing_any_capability" });
+          log.warn("jwt_capability_denied", {
+            method: request.method,
+            path: new URL(request.url).pathname,
+            reason: "missing_any_capability",
+          });
           return { verified: false, payload: null };
         }
         break;
       // PULL method
       case "GET":
         if (this.checkIfV2OnlyPath(request) && payload.capabilities.length === 0) {
-          log.warn("jwt_capability_denied", { method: request.method, url: request.url, reason: "no_capabilities_for_v2" });
+          log.warn("jwt_capability_denied", {
+            method: request.method,
+            path: new URL(request.url).pathname,
+            reason: "no_capabilities_for_v2",
+          });
           return { verified: false, payload: null };
         }
 
@@ -253,7 +271,11 @@ export class RegistryTokens implements Authenticator {
         }
 
         if (!payload.capabilities.includes("pull")) {
-          log.warn("jwt_capability_denied", { method: request.method, url: request.url, required: "pull" });
+          log.warn("jwt_capability_denied", {
+            method: request.method,
+            path: new URL(request.url).pathname,
+            required: "pull",
+          });
           return { verified: false, payload: null };
         }
         break;
@@ -264,7 +286,11 @@ export class RegistryTokens implements Authenticator {
       case "DELETE":
       case "PATCH":
         if (!payload.capabilities.includes("push")) {
-          log.warn("jwt_capability_denied", { method: request.method, required: "push" });
+          log.warn("jwt_capability_denied", {
+            method: request.method,
+            path: new URL(request.url).pathname,
+            required: "push",
+          });
           return { verified: false, payload: null };
         }
         break;
