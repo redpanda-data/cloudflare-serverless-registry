@@ -15,7 +15,7 @@ import { AuthErrorResponse } from "../src/errors";
 import { registries } from "../src/registry/registry";
 import { normalizeR2KeyPrefix } from "../src/registry/r2";
 import type { ReferrerDescriptor } from "../src/registry/registry";
-import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
+import { authHeaderIntoAuthContext, isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
 import { encode } from "@cfworker/base64url";
 import { ManifestSchema } from "../src/manifest";
 import { limit } from "../src/chunk";
@@ -2019,25 +2019,25 @@ test("registries configuration", async () => {
     {
       configuration: "{}",
       expected: [],
-      error: '"event":"registries_json_parse_error"',
-      partialError: true,
+      error: "zod error:\n✖ Invalid input: expected array, received object",
+      partialError: false,
     },
     {
       configuration: "[{}]",
       expected: [],
-      error: '"event":"registries_json_parse_error"',
+      error: "✖ Invalid input: expected string, received undefined\n  → at [0].registry",
       partialError: true,
     },
     {
       configuration: `[{ "registry": "no-url/hello-world" }]`,
       expected: [],
-      error: '"event":"registries_json_parse_error"',
+      error: "✖ Invalid URL\n  → at [0].registry",
       partialError: true,
     },
     {
       configuration: "bla bla bla no json",
       expected: [],
-      error: '"event":"registries_json_parse_error"',
+      error: "error SyntaxError: Unexpected token",
       partialError: true,
     },
     {
@@ -2103,19 +2103,59 @@ test("registries configuration", async () => {
     let calledError = false;
     const prevConsoleError = console.error;
     console.error = (output) => {
+      const parsed = JSON.parse(output as string);
+      expect(parsed).toMatchObject({ level: "error", event: "registries_json_parse_error" });
       if (!testCase.partialError) {
-        expect(output).toEqual(testCase.error);
+        expect(parsed.error).toEqual(testCase.error);
       } else {
-        expect(output).toContain(testCase.error);
+        expect(parsed.error).toContain(testCase.error);
       }
 
       calledError = true;
     };
-    const r = registries(bindingCopy);
-    expect(r).toEqual(testCase.expected);
-    expect(calledError).toEqual(expectErrorOutput);
-    console.error = prevConsoleError;
+    try {
+      const r = registries(bindingCopy);
+      expect(r).toEqual(testCase.expected);
+      expect(calledError).toEqual(expectErrorOutput);
+    } finally {
+      console.error = prevConsoleError;
+    }
   }
+});
+
+describe("authHeaderIntoAuthContext", () => {
+  test("parses realm and service whether or not there's a space after the comma", () => {
+    const url = new URL("https://registry.example.com");
+    const noSpace = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token",service="registry.example.com"`,
+    );
+    const withSpace = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token", service="registry.example.com"`,
+    );
+    expect(noSpace).toEqual({
+      authType: "bearer",
+      realm: "https://auth.example.com/token",
+      service: "registry.example.com",
+      scope: "",
+    });
+    expect(withSpace).toEqual(noSpace);
+  });
+
+  test("does not mis-split a quoted scope value that contains a literal comma", () => {
+    const url = new URL("https://registry.example.com");
+    const ctx = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:foo:pull,push"`,
+    );
+    expect(ctx).toEqual({
+      authType: "bearer",
+      realm: "https://auth.example.com/token",
+      service: "registry.example.com",
+      scope: "repository:foo:pull,push",
+    });
+  });
 });
 
 describe("http client", () => {
