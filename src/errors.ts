@@ -54,7 +54,7 @@ function wwwAuthenticate(r: Request, tokenRealm?: string): string {
   // `host:443` here would make the client's token request fail to validate.
   const service = new URL(r.url).hostname;
   let challenge = `Bearer realm="${tokenRealm}",service="${service}"`;
-  const repo = repositoryNameFromUrl(r.url);
+  const repo = repositoryNameFromUrl(r.url, r.method);
   const action = actionForMethod(r.method);
   if (repo !== null && action !== null) {
     challenge += `,scope="repository:${repo}:${action}"`;

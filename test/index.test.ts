@@ -8,6 +8,7 @@ import {
   bearerTokenFromHeader,
   stripUsernamePasswordFromHeader,
   scopeAuthorizes,
+  repositoryNameFromUrl,
 } from "../src/auth";
 import { decodeBase64Loose } from "../src/utils";
 import { AuthErrorResponse } from "../src/errors";
@@ -1685,6 +1686,109 @@ describe("tokens", async () => {
       } as RegistryAuthProtocolTokenPayload);
       expect(correctRepo.verified).toBeTruthy();
     });
+
+    test("a repo name with an embedded boundary segment is scoped by its full router-matched name", () => {
+      // The router's `/:name+/blobs/uploads/` route is greedy: for a path
+      // containing "/blobs/" twice, it captures everything up to the LAST
+      // "/blobs/uploads/" as `name` -- e.g. `name = "foo/blobs/sibling"` for
+      // this URL. A token scoped only to "foo" must not be authorized here:
+      // the scope check must compute the same (longer) name the router will
+      // actually dispatch to.
+      const url = "/v2/foo/blobs/sibling/blobs/uploads/";
+      const { verified } = RegistryTokens.verifyPayload(createRequest("POST", url, null), {
+        capabilities: ["push"],
+        scope: "repository:foo:push",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+
+      // A token scoped to the full, router-matched name is correctly authorized.
+      const correctlyScoped = RegistryTokens.verifyPayload(createRequest("POST", url, null), {
+        capabilities: ["push"],
+        scope: "repository:foo/blobs/sibling:push",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(correctlyScoped.verified).toBeTruthy();
+    });
+
+    test("a repo name containing a DIFFERENT boundary type is scoped by its full router-matched name", () => {
+      // Repo name "foo/manifests/bar" contains "/manifests/", but this
+      // request targets the later "/blobs/" boundary. A token scoped only
+      // to "foo" must not be authorized: the scope check must pick whichever
+      // boundary occurs latest overall, not whichever boundary type is
+      // checked first.
+      const url = "/v2/foo/manifests/bar/blobs/sha256:abc";
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", url, null), {
+        capabilities: ["pull"],
+        scope: "repository:foo:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeFalsy();
+
+      const correctlyScoped = RegistryTokens.verifyPayload(createRequest("GET", url, null), {
+        capabilities: ["pull"],
+        scope: "repository:foo/manifests/bar:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(correctlyScoped.verified).toBeTruthy();
+    });
+
+    test("a manifest tag starting with 'gc' is not mistaken for the POST-only /gc boundary", () => {
+      // GET /v2/foo/manifests/gc-tag: a spec-legal tag that happens to start
+      // with "gc". A token scoped to "foo" (the router's real match) must be
+      // authorized; treating the bare "/gc" substring as a boundary on this
+      // GET request would incorrectly compute "foo/manifests" and deny it.
+      const url = "/v2/foo/manifests/gc-tag";
+      const { verified } = RegistryTokens.verifyPayload(createRequest("GET", url, null), {
+        capabilities: ["pull"],
+        scope: "repository:foo:pull",
+      } as RegistryAuthProtocolTokenPayload);
+      expect(verified).toBeTruthy();
+    });
+  });
+});
+
+describe("repositoryNameFromUrl", () => {
+  test("extracts the name up to the first boundary when it only occurs once", () => {
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/bar/manifests/v1", "GET")).toBe("foo/bar");
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/blobs/sha256:abc", "GET")).toBe("foo");
+  });
+
+  test("extracts the name up to the LAST occurrence of an embedded boundary (matches router greediness)", () => {
+    // Mirrors the router's greedy `/:name+/blobs/uploads/` capture: everything
+    // up to the final "/blobs/uploads/" is the name, including any earlier
+    // "/blobs/" segment.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/blobs/sibling/blobs/uploads/", "POST")).toBe(
+      "foo/blobs/sibling",
+    );
+  });
+
+  test("picks whichever boundary TYPE occurs latest, not whichever type is checked first", () => {
+    // Repo name contains "/manifests/" but the request targets a later
+    // "/blobs/" boundary. Checking boundary types in a fixed order and
+    // returning on the first type that matches at all (even via
+    // lastIndexOf) would incorrectly stop at "/manifests/" and return a
+    // shorter name than the router's greedy /:name+/blobs/:digest capture.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/manifests/bar/blobs/sha256:abc", "GET")).toBe(
+      "foo/manifests/bar",
+    );
+    // And the reverse: repo name contains "/blobs/", request targets a
+    // later "/manifests/" boundary.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/blobs/bar/manifests/v1", "GET")).toBe(
+      "foo/blobs/bar",
+    );
+  });
+
+  test("only treats /gc as a candidate boundary for POST (the route is POST-only)", () => {
+    // A manifest tag that merely starts with "gc" (spec-legal) must not be
+    // mistaken for the bare "/gc" boundary on a non-POST request.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/manifests/gc-tag", "GET")).toBe("foo");
+    // Even when the tag is literally "gc" and the path textually ends in
+    // "/gc", a GET must resolve via the /manifests/ boundary, not /gc.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/gc/manifests/gc", "GET")).toBe("foo/gc");
+    // A genuine POST /gc request still resolves correctly.
+    expect(repositoryNameFromUrl("https://registry.example/v2/foo/gc", "POST")).toBe("foo");
+  });
+
+  test("returns null for non-repository paths", () => {
+    expect(repositoryNameFromUrl("https://registry.example/v2/", "GET")).toBeNull();
+    expect(repositoryNameFromUrl("https://registry.example/v2/_catalog", "GET")).toBeNull();
   });
 });
 
