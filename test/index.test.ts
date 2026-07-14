@@ -13,6 +13,7 @@ import {
 import { decodeBase64Loose } from "../src/utils";
 import { AuthErrorResponse } from "../src/errors";
 import { registries } from "../src/registry/registry";
+import { normalizeR2KeyPrefix } from "../src/registry/r2";
 import type { ReferrerDescriptor } from "../src/registry/registry";
 import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
 import { encode } from "@cfworker/base64url";
@@ -2685,6 +2686,67 @@ describe("push and catalog", () => {
     expect(body.repositories).toContain(name);
     expect(body.repositories.filter((repository) => repository.startsWith(`${name}/_referrers`))).toEqual([]);
   });
+
+  test("catalog and pagination stay unprefixed when R2_KEY_PREFIX is configured", async () => {
+    // Regression test: listRepositories() must scope its list() calls to
+    // R2_KEY_PREFIX and strip that prefix back off every repository name
+    // and cursor it returns — otherwise /v2/_catalog leaks the internal R2
+    // namespace (e.g. "artifacts/containers/hello" instead of "hello") and
+    // pagination breaks, since a client-supplied `last` value is always
+    // unprefixed per the OCI catalog contract.
+    const bindings = env as Env;
+    const previousPrefix = bindings.R2_KEY_PREFIX;
+    bindings.R2_KEY_PREFIX = "artifacts/containers/";
+    try {
+      await createManifest("catalog-prefix-a", await generateManifest("catalog-prefix-a"), "hello");
+      await createManifest("catalog-prefix-b", await generateManifest("catalog-prefix-b"), "hello");
+
+      const response = await fetch(createRequest("GET", "/v2/_catalog", null));
+      expect(response.ok).toBeTruthy();
+      const body = (await response.json()) as { repositories: string[] };
+      expect(body.repositories).toEqual(["catalog-prefix-a", "catalog-prefix-b"]);
+
+      // Paginate with n=1 — exercises `last`/cursor round-tripping through
+      // startAfter with the prefix re-applied and stripped correctly.
+      const repositoryBuildUp: string[] = [];
+      let currentPath = "/v2/_catalog?n=1";
+      for (let i = 0; i < 3; i++) {
+        const page = await fetch(createRequest("GET", currentPath, null));
+        expect(page.ok).toBeTruthy();
+        const pageBody = (await page.json()) as { repositories: string[] };
+        if (pageBody.repositories.length === 0) break;
+        repositoryBuildUp.push(...pageBody.repositories);
+        const url = parseLinkHeaderURL(page.headers.get("Link")!);
+        currentPath = url.pathname + url.search;
+      }
+      expect(repositoryBuildUp).toEqual(body.repositories);
+
+      // Confirm objects actually live under the prefix (not at the
+      // unprefixed root), so the assertions above are exercising the
+      // prefixed path and not accidentally passing against stale data.
+      // 2, not 1: putManifest writes both a tag-keyed and a digest-keyed
+      // copy (see putManifestInner in src/registry/r2.ts).
+      expect(
+        (await bindings.REGISTRY.list({ prefix: "artifacts/containers/catalog-prefix-a/manifests/" })).objects.length,
+      ).toEqual(2);
+      expect((await bindings.REGISTRY.list({ prefix: "catalog-prefix-a/manifests/" })).objects.length).toEqual(0);
+    } finally {
+      bindings.R2_KEY_PREFIX = previousPrefix;
+    }
+  });
+});
+
+describe("normalizeR2KeyPrefix", () => {
+  test("trailing slash is optional and normalized on", () => {
+    expect(normalizeR2KeyPrefix("artifacts/containers")).toEqual("artifacts/containers/");
+    expect(normalizeR2KeyPrefix("artifacts/containers/")).toEqual("artifacts/containers/");
+    // A doubly (or more) slashed input collapses to exactly one trailing
+    // slash too, matching this function's "exactly one" contract.
+    expect(normalizeR2KeyPrefix("artifacts/containers//")).toEqual("artifacts/containers/");
+    expect(normalizeR2KeyPrefix("artifacts/containers///")).toEqual("artifacts/containers/");
+    expect(normalizeR2KeyPrefix("")).toEqual("");
+    expect(normalizeR2KeyPrefix(undefined)).toEqual("");
+  });
 });
 
 async function createManifestList(name: string, tag?: string): Promise<string[]> {
@@ -3077,6 +3139,60 @@ describe("garbage collector", () => {
       expect(listManifests.objects.length).toEqual(0);
       const listBlobs = await bindings.REGISTRY.list({ prefix: `${prodName}/blobs/` });
       expect(listBlobs.objects.length).toEqual(0);
+    }
+  });
+
+  test("GC's list()-then-compare logic still matches when R2_KEY_PREFIX is configured", async () => {
+    // Regression test for the GC prefix wiring: every list() call inside
+    // GarbageCollector is prefixed, and so is every comparison made against
+    // the keys that list() returns (startsWith checks, and the cross-repo
+    // symlink target lookup). If either side of one of those comparisons
+    // were left unprefixed, GC would silently stop collecting garbage, or
+    // (as exercised here) incorrectly delete a blob that's still referenced
+    // via a cross-repo symlink.
+    const bindings = env as Env;
+    const previousPrefix = bindings.R2_KEY_PREFIX;
+    bindings.R2_KEY_PREFIX = "artifacts/containers/";
+    try {
+      const srcName = "gc-prefix-src";
+      const dstName = "gc-prefix-dst";
+
+      const manifest = await generateManifest(srcName);
+      await createManifest(srcName, manifest, "only-tag");
+
+      // Mount (symlink) the source's layers into a second repository, then
+      // publish a manifest there referencing the same digests.
+      await mountLayersFromManifest(srcName, manifest, dstName);
+      await createManifest(dstName, manifest, "app");
+
+      // Sanity check: objects actually live under the configured prefix,
+      // and not at the unprefixed root.
+      expect(
+        (await bindings.REGISTRY.list({ prefix: `artifacts/containers/${srcName}/manifests/` })).objects.length,
+      ).toEqual(2);
+      expect((await bindings.REGISTRY.list({ prefix: `${srcName}/manifests/` })).objects.length).toEqual(0);
+
+      // Untag the source image so its manifest becomes GC-eligible.
+      const res = await fetch(createRequest("DELETE", `/v2/${srcName}/manifests/only-tag`, null));
+      expect(res.status).toEqual(202);
+
+      await runGarbageCollector(srcName, "untagged");
+
+      // The now-untagged manifest is gone...
+      expect(
+        (await bindings.REGISTRY.list({ prefix: `artifacts/containers/${srcName}/manifests/` })).objects.length,
+      ).toEqual(0);
+      // ...but its blobs must survive: dstName still holds symlinks to them.
+      // Had the prefix not been applied consistently on both sides of GC's
+      // symlink-target comparison, these would have been deleted here.
+      expect(
+        (await bindings.REGISTRY.list({ prefix: `artifacts/containers/${srcName}/blobs/` })).objects.length,
+      ).toEqual(2);
+      expect(
+        (await bindings.REGISTRY.list({ prefix: `artifacts/containers/${dstName}/blobs/` })).objects.length,
+      ).toEqual(2);
+    } finally {
+      bindings.R2_KEY_PREFIX = previousPrefix;
     }
   });
 });

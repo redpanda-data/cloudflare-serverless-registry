@@ -43,6 +43,22 @@ export interface Env {
   PUSH_COMPATIBILITY_MODE?: PushCompatibilityMode;
   REGISTRIES_JSON?: string; // should be in the format of RegistryConfiguration[];
   REGISTRY_CLIENT: Registry;
+  /**
+   * Prefix prepended to the R2 object keys that make up the durable OCI
+   * data this Worker owns (manifests, blobs, upload state, referrers,
+   * etc). A few short-lived, purely internal keys are deliberately left
+   * unprefixed (e.g. the multipart-upload scratch/chunk-helper objects,
+   * keyed by a bare UUID) since they never collide across namespaces and
+   * aren't part of what's being namespaced. Used to namespace container
+   * artifacts within a bucket shared with other, non-container artifact
+   * types (e.g. set to "artifacts/containers/"). Unset/empty is a
+   * no-op — keys are written unprefixed at the bucket root, which keeps
+   * local dev (`wrangler dev`) and other consumers of this fork working
+   * without any configuration. A trailing "/" is optional and normalized on
+   * (see `normalizeR2KeyPrefix`), so "artifacts/containers" and
+   * "artifacts/containers/" behave identically.
+   */
+  R2_KEY_PREFIX?: string;
 }
 
 const router = Router();

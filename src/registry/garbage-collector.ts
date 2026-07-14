@@ -5,7 +5,7 @@
 
 import { ManifestSchema } from "../manifest";
 import { hexToDigest } from "../user";
-import { symlinkHeader } from "./r2";
+import { normalizeR2KeyPrefix, symlinkHeader } from "./r2";
 
 export type GarbageCollectionMode = "unreferenced" | "untagged";
 export type GCOptions = {
@@ -39,17 +39,25 @@ export type GCOptions = {
 // In the GC code, if there is an insertion on-going, there is an error.
 export class GarbageCollector {
   private registry: R2Bucket;
+  private prefix: string;
 
-  constructor(registry: R2Bucket) {
+  constructor(registry: R2Bucket, prefix: string = "") {
     this.registry = registry;
+    this.prefix = normalizeR2KeyPrefix(prefix);
+  }
+
+  // withPrefix namespaces a raw R2 key/prefix under the configured
+  // R2_KEY_PREFIX. Unset/empty is a no-op.
+  private withPrefix(key: string): string {
+    return `${this.prefix}${key}`;
   }
 
   async markForGarbageCollection(namespace: string): Promise<string> {
     const etag = crypto.randomUUID();
-    const deletion = await this.registry.put(`${namespace}/gc/marker`, etag);
+    const deletion = await this.registry.put(this.withPrefix(`${namespace}/gc/marker`), etag);
     if (deletion === null) throw new Error("unreachable");
     // set last_update so inserters are able to invalidate
-    await this.registry.put(`${namespace}/gc/last_update`, null, {
+    await this.registry.put(this.withPrefix(`${namespace}/gc/last_update`), null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
     return etag;
@@ -57,14 +65,14 @@ export class GarbageCollector {
 
   async cleanupGarbageCollectionMark(namespace: string) {
     // set last_update so inserters can confirm that a GC didnt happen while they were confirming data
-    await this.registry.put(`${namespace}/gc/last_update`, null, {
+    await this.registry.put(this.withPrefix(`${namespace}/gc/last_update`), null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
-    await this.registry.delete(`${namespace}/gc/marker`);
+    await this.registry.delete(this.withPrefix(`${namespace}/gc/marker`));
   }
 
   async getGCMarker(namespace: string): Promise<string> {
-    const object = await this.registry.head(`${namespace}/gc/last_update`);
+    const object = await this.registry.head(this.withPrefix(`${namespace}/gc/last_update`));
     if (object === null) {
       return "";
     }
@@ -77,7 +85,7 @@ export class GarbageCollector {
   }
 
   async checkCanInsertData(namespace: string, mark: string): Promise<boolean> {
-    const gcMarker = await this.registry.head(`${namespace}/gc/marker`);
+    const gcMarker = await this.registry.head(this.withPrefix(`${namespace}/gc/marker`));
     if (gcMarker !== null) {
       return false;
     }
@@ -94,10 +102,10 @@ export class GarbageCollector {
   async markForInsertion(namespace: string): Promise<string> {
     const uid = crypto.randomUUID();
     // mark that there is an on-going insertion
-    const deletion = await this.registry.put(`${namespace}/insertion/${uid}`, uid);
+    const deletion = await this.registry.put(this.withPrefix(`${namespace}/insertion/${uid}`), uid);
     if (deletion === null) throw new Error("unreachable");
     // set last_update so GC is able to invalidate
-    await this.registry.put(`${namespace}/insertion/last_update`, null, {
+    await this.registry.put(this.withPrefix(`${namespace}/insertion/last_update`), null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
 
@@ -106,15 +114,15 @@ export class GarbageCollector {
 
   async cleanInsertion(namespace: string, tag: string) {
     // update again to invalidate GC and the insertion is safe
-    await this.registry.put(`${namespace}/insertion/last_update`, null, {
+    await this.registry.put(this.withPrefix(`${namespace}/insertion/last_update`), null, {
       customMetadata: { timestamp: `${Date.now()}-${crypto.randomUUID()}` },
     });
 
-    await this.registry.delete(`${namespace}/insertion/${tag}`);
+    await this.registry.delete(this.withPrefix(`${namespace}/insertion/${tag}`));
   }
 
   async getInsertionMark(namespace: string): Promise<string> {
-    const object = await this.registry.head(`${namespace}/insertion/last_update`);
+    const object = await this.registry.head(this.withPrefix(`${namespace}/insertion/last_update`));
     if (object === null) {
       return "";
     }
@@ -127,7 +135,7 @@ export class GarbageCollector {
   }
 
   async checkIfGCCanContinue(namespace: string, mark: string): Promise<boolean> {
-    const objects = await this.registry.list({ prefix: `${namespace}/insertion` });
+    const objects = await this.registry.list({ prefix: this.withPrefix(`${namespace}/insertion`) });
     for (const object of objects.objects) {
       if (object.key.endsWith("/last_update")) continue;
       if (object.uploaded.getTime() + 1000 * 60 <= Date.now()) {
@@ -188,7 +196,7 @@ export class GarbageCollector {
     const mark = await this.getInsertionMark(options.name);
 
     // List manifest from repo to be scanned
-    await this.list(`${options.name}/manifests/`, async (manifestObject) => {
+    await this.list(this.withPrefix(`${options.name}/manifests/`), async (manifestObject) => {
       const currentHashFile = hexToDigest(manifestObject.checksums.sha256!);
       if (manifestList[currentHashFile] === undefined) {
         manifestList[currentHashFile] = new Set<string>();
@@ -216,7 +224,7 @@ export class GarbageCollector {
         liveManifests.add(digest);
         pendingLiveManifests.push(digest);
       };
-      await this.list(`${options.name}/_referrers/`, async (object) => {
+      await this.list(this.withPrefix(`${options.name}/_referrers/`), async (object) => {
         const parts = object.key.split("/");
         const subjectDigest = parts[parts.length - 2];
         const referrerDigest = parts[parts.length - 1];
@@ -347,7 +355,7 @@ export class GarbageCollector {
 
     const unreferencedBlobs = new Set<string>();
     // List blobs to be removed
-    await this.list(`${options.name}/blobs/`, async (object) => {
+    await this.list(this.withPrefix(`${options.name}/blobs/`), async (object) => {
       const blobHash = object.key.split("/").pop();
       if (blobHash && !referencedBlobs.has(blobHash)) {
         unreferencedBlobs.add(object.key);
@@ -357,10 +365,13 @@ export class GarbageCollector {
 
     // Check for symlink before removal
     if (unreferencedBlobs.size >= 0) {
-      await this.list("", async (object) => {
+      // Scoped to our own namespace (this.prefix) rather than the whole
+      // bucket, since that's the only place our own objects (and therefore
+      // symlinks pointing at them) can live.
+      await this.list(this.prefix, async (object) => {
         const objectPath = object.key;
         // Skip non-blobs object and from any other repository (symlink only target cross repository blobs)
-        if (objectPath.startsWith(`${options.name}/`) || !objectPath.includes("/blobs/sha256:")) {
+        if (objectPath.startsWith(this.withPrefix(`${options.name}/`)) || !objectPath.includes("/blobs/sha256:")) {
           return true;
         }
         if (object.customMetadata && object.customMetadata[symlinkHeader] !== undefined) {
@@ -370,8 +381,11 @@ export class GarbageCollector {
           const symlinkBlob = await this.registry.get(object.key);
           // Skip if symlinkBlob not found
           if (!symlinkBlob) return true;
-          // Get the path of the target blob from the symlink blob
-          const targetBlobPath = await symlinkBlob.text();
+          // Get the path of the target blob from the symlink blob. This is
+          // stored unprefixed (see mountExistingLayer in r2.ts), so add the
+          // prefix back before comparing against unreferencedBlobs, whose
+          // keys came straight from list() and are therefore prefixed.
+          const targetBlobPath = this.withPrefix(await symlinkBlob.text());
           if (unreferencedBlobs.has(targetBlobPath)) {
             // This symlink target a layer that should be removed
             unreferencedBlobs.delete(targetBlobPath);

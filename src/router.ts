@@ -19,7 +19,7 @@ import {
   registries,
 } from "./registry/registry";
 import { RegistryHTTPClient } from "./registry/http";
-import { ociImageIndexContentType } from "./registry/r2";
+import { ociImageIndexContentType, withPrefix } from "./registry/r2";
 import {
   blobCacheHeaders,
   manifestCacheHeaders,
@@ -83,14 +83,14 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
 
   const { last, limit } = req.query;
   const { name, reference } = req.params;
-  const manifest = await env.REGISTRY.head(`${name}/manifests/${reference}`);
+  const manifest = await env.REGISTRY.head(withPrefix(env, `${name}/manifests/${reference}`));
   if (manifest === null) {
     return new Response(JSON.stringify(ManifestUnknownError(reference)), { status: 404, headers: jsonHeaders() });
   }
   const manifestDigest = hexToDigest(manifest.checksums.sha256!);
   let subjectDigest = manifest.customMetadata?.subjectDigest;
   if (subjectDigest === undefined && manifest.customMetadata?.hasSubject !== "false") {
-    const manifestBody = await env.REGISTRY.get(`${name}/manifests/${reference}`);
+    const manifestBody = await env.REGISTRY.get(withPrefix(env, `${name}/manifests/${reference}`));
     if (manifestBody !== null) {
       try {
         const manifestJSON = (await manifestBody.json()) as { subject?: { digest: string } };
@@ -105,7 +105,7 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
     throw new ServerError("invalid 'limit' parameter", 400);
   }
   const tags = await env.REGISTRY.list({
-    prefix: `${name}/manifests`,
+    prefix: withPrefix(env, `${name}/manifests`),
     limit: limitInt,
     cursor: last?.toString(),
   });
@@ -114,7 +114,10 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
       continue;
     }
 
-    if (hexToDigest(tag.checksums.sha256) === reference && tag.key !== `${name}/manifests/${reference}`) {
+    if (
+      hexToDigest(tag.checksums.sha256) === reference &&
+      tag.key !== withPrefix(env, `${name}/manifests/${reference}`)
+    ) {
       await env.REGISTRY.delete(tag.key);
     }
   }
@@ -133,10 +136,10 @@ v2Router.delete("/:name+/manifests/:reference", async (req, env: Env) => {
 
   // Last but not least, delete the manifest entry and remove the deleted manifest's own referrer
   // index entry if it points at another subject.
-  await env.REGISTRY.delete(`${name}/manifests/${reference}`);
+  await env.REGISTRY.delete(withPrefix(env, `${name}/manifests/${reference}`));
   if (reference === manifestDigest) {
     if (subjectDigest !== undefined && isValidDigest(subjectDigest)) {
-      await env.REGISTRY.delete(`${name}/_referrers/${subjectDigest}/${manifestDigest}`);
+      await env.REGISTRY.delete(withPrefix(env, `${name}/_referrers/${subjectDigest}/${manifestDigest}`));
     }
   }
   return new Response("", {
@@ -664,7 +667,7 @@ v2Router.put("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
 v2Router.head("/:name+/blobs/:tag", async (req, env: Env) => {
   const { name, tag } = req.params;
 
-  const res = await env.REGISTRY.head(`${name}/blobs/${tag}`);
+  const res = await env.REGISTRY.head(withPrefix(env, `${name}/blobs/${tag}`));
   let layerExistsResponse: CheckLayerResponse | null = null;
   if (!res) {
     const registryList = registries(env);
@@ -729,21 +732,23 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
   }
 
   let tags = await env.REGISTRY.list({
-    prefix: `${name}/manifests`,
+    prefix: withPrefix(env, `${name}/manifests`),
     limit: n,
-    startAfter: last ? `${name}/manifests/${last}` : undefined,
+    startAfter: last ? withPrefix(env, `${name}/manifests/${last}`) : undefined,
   });
   // Filter out sha256 manifest
-  let manifestTags = tags.objects.filter((tag) => !tag.key.startsWith(`${name}/manifests/sha256:`));
+  let manifestTags = tags.objects.filter((tag) => !tag.key.startsWith(withPrefix(env, `${name}/manifests/sha256:`)));
   // If results are truncated and the manifest filter removed some result, extend the search to reach the n number of results expected by the client
   while (tags.objects.length > 0 && tags.truncated && manifestTags.length !== n) {
     tags = await env.REGISTRY.list({
-      prefix: `${name}/manifests`,
+      prefix: withPrefix(env, `${name}/manifests`),
       limit: n - manifestTags.length,
       cursor: tags.cursor,
     });
     // Filter out sha256 manifest
-    manifestTags = manifestTags.concat(tags.objects.filter((tag) => !tag.key.startsWith(`${name}/manifests/sha256:`)));
+    manifestTags = manifestTags.concat(
+      tags.objects.filter((tag) => !tag.key.startsWith(withPrefix(env, `${name}/manifests/sha256:`))),
+    );
   }
 
   const keys = manifestTags.map((object) => object.key.split("/").pop()!);
@@ -772,13 +777,13 @@ v2Router.get("/:name+/tags/list", async (req, env: Env) => {
 v2Router.delete("/:name+/blobs/:digest", async (req, env: Env) => {
   const { name, digest } = req.params;
 
-  const res = await env.REGISTRY.head(`${name}/blobs/${digest}`);
+  const res = await env.REGISTRY.head(withPrefix(env, `${name}/blobs/${digest}`));
 
   if (!res) {
     return new Response(JSON.stringify(BlobUnknownError), { status: 404 });
   }
 
-  await env.REGISTRY.delete(`${name}/blobs/${digest}`);
+  await env.REGISTRY.delete(withPrefix(env, `${name}/blobs/${digest}`));
   return new Response(null, {
     status: 202,
     headers: {
