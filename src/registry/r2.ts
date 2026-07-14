@@ -357,9 +357,16 @@ export class R2Registry implements Registry {
       });
 
       let found = false;
-      // Search for the next object in the list
+      // Search for the next object in the list. Must check the
+      // currently-iterated object.key here, not the stale outer-scope
+      // lastSeen — the while-loop's own precondition already
+      // guarantees objectExistsInPath(lastSeen) is true on entry, so
+      // checking lastSeen here is a tautological no-op that never breaks,
+      // silently advancing lastSeen (and thus the returned cursor) past
+      // repositories that were seen but never registered because the
+      // caller's limit was already hit.
       for (const object of nextList.objects) {
-        if (!objectExistsInPath(lastSeen)) {
+        if (!objectExistsInPath(stripPrefix(object.key))) {
           found = true;
           break;
         }
