@@ -34,12 +34,27 @@ import { ManifestSchema, manifestSchema } from "../manifest";
 
 export const ociImageIndexContentType = "application/vnd.oci.image.index.v1+json";
 
-function referrersPrefix(name: string, digest: string): string {
-  return `${name}/_referrers/${digest}/`;
+// normalizeR2KeyPrefix ensures a configured prefix always ends in exactly
+// one "/" (or is "" when unset/empty), so "artifacts/containers" and
+// "artifacts/containers/" behave identically instead of the former
+// producing keys like "artifacts/containers<name>/...".
+export function normalizeR2KeyPrefix(raw: string | undefined): string {
+  if (!raw) return "";
+  return `${raw.replace(/\/+$/, "")}/`;
 }
 
-function referrersPath(name: string, subjectDigest: string, digest: string): string {
-  return `${referrersPrefix(name, subjectDigest)}${digest}`;
+// withPrefix namespaces a raw R2 key under env.R2_KEY_PREFIX. Unset/empty is
+// a no-op, so unprefixed keys are unaffected (e.g. local dev).
+export function withPrefix(env: Env, key: string): string {
+  return `${normalizeR2KeyPrefix(env.R2_KEY_PREFIX)}${key}`;
+}
+
+function referrersPrefix(env: Env, name: string, digest: string): string {
+  return withPrefix(env, `${name}/_referrers/${digest}/`);
+}
+
+function referrersPath(env: Env, name: string, subjectDigest: string, digest: string): string {
+  return `${referrersPrefix(env, name, subjectDigest)}${digest}`;
 }
 
 function artifactTypeFromManifest(manifest: ManifestSchema): string | undefined {
@@ -163,12 +178,12 @@ export type State = {
   name: string;
 };
 
-export function getRegistryUploadsPath(state: { registryUploadId: string; name: string }): string {
-  return `${state.name}/uploads/${state.registryUploadId}`;
+export function getRegistryUploadsPath(env: Env, state: { registryUploadId: string; name: string }): string {
+  return withPrefix(env, `${state.name}/uploads/${state.registryUploadId}`);
 }
 
 export async function getJWT(env: Env, state: { registryUploadId: string; name: string }): Promise<string | null> {
-  const stateObject = await env.REGISTRY.get(getRegistryUploadsPath(state));
+  const stateObject = await env.REGISTRY.get(getRegistryUploadsPath(env, state));
   if (stateObject === null) return null;
   try {
     const metadata = await stateObject.json<{ jwt?: string }>();
@@ -193,7 +208,7 @@ export async function encodeState(state: State, env: Env): Promise<{ jwt: string
     },
   );
 
-  await env.REGISTRY.put(getRegistryUploadsPath(state), JSON.stringify({ jwt: jwtSignature }));
+  await env.REGISTRY.put(getRegistryUploadsPath(env, state), JSON.stringify({ jwt: jwtSignature }));
   return { jwt: jwtSignature, hash: await getSHA256(jwtSignature, "") };
 }
 
@@ -229,11 +244,11 @@ export class R2Registry implements Registry {
   private gc: GarbageCollector;
 
   constructor(private env: Env) {
-    this.gc = new GarbageCollector(this.env.REGISTRY);
+    this.gc = new GarbageCollector(this.env.REGISTRY, this.env.R2_KEY_PREFIX ?? "");
   }
 
   async manifestExists(name: string, reference: string): Promise<RegistryError | CheckManifestResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/manifests/${reference}`));
+    const [res, err] = await wrap(this.env.REGISTRY.head(withPrefix(this.env, `${name}/manifests/${reference}`)));
     if (err) {
       return wrapError("manifestExists", err);
     }
@@ -264,9 +279,18 @@ export class R2Registry implements Registry {
     // This means we slice the last two items in the key and add them to our hash map.
     // At the end, we start skipping entries until we find another unique key, then we return that entry as startAfter.
 
+    // R2_KEY_PREFIX-aware: every key in the bucket may carry a leading
+    // namespace prefix (DEVPROD-4461), so listing must be scoped to it and
+    // every key/cursor value stripped back to its unprefixed form before
+    // repository names are derived or returned — repository names and the
+    // `last` cursor are part of the OCI catalog contract clients see, and
+    // must never leak the internal R2 namespace.
+    const prefix = withPrefix(this.env, "");
+    const stripPrefix = (key: string) => key.slice(prefix.length);
+
     const options = {
       limit: limit ?? 1000,
-      startAfter: last ?? undefined,
+      startAfter: last !== undefined ? `${prefix}${last}` : undefined,
     };
     const repositories = new Set<string>();
     let totalRecords = 0;
@@ -280,18 +304,19 @@ export class R2Registry implements Registry {
 
     const repositoriesOrder: string[] = [];
     const addObjectPath = (object: R2Object) => {
-      if (totalRecords >= options.limit && !objectExistsInPath(object.key)) {
+      const key = stripPrefix(object.key);
+      if (totalRecords >= options.limit && !objectExistsInPath(key)) {
         return;
       }
 
       // update lastSeen for cursoring purposes
-      lastSeen = object.key;
+      lastSeen = key;
       // don't add if seen before
       if (totalRecords >= options.limit) return;
       // skip either 'manifests' or 'blobs'
       // name format is:
       // <path>/<'blobs' | 'manifests'>/<name>
-      const parts = object.key.split("/");
+      const parts = key.split("/");
       if (parts[parts.length - 2] !== "manifests") {
         return;
       }
@@ -305,6 +330,7 @@ export class R2Registry implements Registry {
 
     const r2Objects = await this.env.REGISTRY.list({
       limit: 50,
+      prefix,
       startAfter: options.startAfter,
     });
     r2Objects.objects.forEach((path) => addObjectPath(path));
@@ -312,6 +338,7 @@ export class R2Registry implements Registry {
     while (cursor !== undefined && totalRecords < options.limit) {
       const next = await this.env.REGISTRY.list({
         limit: 50,
+        prefix,
         cursor,
       });
       next.objects.forEach((path) => addObjectPath(path));
@@ -325,6 +352,7 @@ export class R2Registry implements Registry {
     while (cursor !== undefined && typeof lastSeen === "string" && objectExistsInPath(lastSeen)) {
       const nextList: R2Objects = await this.env.REGISTRY.list({
         limit: 50,
+        prefix,
         cursor,
       });
 
@@ -336,7 +364,7 @@ export class R2Registry implements Registry {
           break;
         }
 
-        lastSeen = object.key;
+        lastSeen = stripPrefix(object.key);
       }
 
       if (found) break;
@@ -361,7 +389,7 @@ export class R2Registry implements Registry {
     if (manifest.schemaVersion === 2 && "manifests" in manifest) {
       for (const manifestElement of manifest.manifests) {
         const key = manifestElement.digest;
-        const res = await this.env.REGISTRY.head(`${name}/manifests/${key}`);
+        const res = await this.env.REGISTRY.head(withPrefix(this.env, `${name}/manifests/${key}`));
         if (res === null) {
           console.error(`Manifest with digest ${key} doesn't exist`);
           return new ManifestError("BLOB_UNKNOWN", `unknown manifest ${key}`);
@@ -376,7 +404,7 @@ export class R2Registry implements Registry {
         ? manifest.fsLayers.map((layer) => layer.blobSum)
         : [...manifest.layers.map((layer) => layer.digest), manifest.config.digest];
     for (const key of layers) {
-      const res = await this.env.REGISTRY.head(`${name}/blobs/${key}`);
+      const res = await this.env.REGISTRY.head(withPrefix(this.env, `${name}/blobs/${key}`));
       if (res === null) {
         console.error(`Digest ${key} doesn't exist`);
         return new ManifestError("BLOB_UNKNOWN", `unknown blob ${key}`);
@@ -402,14 +430,14 @@ export class R2Registry implements Registry {
     }
 
     const limit = Math.min(Math.max(Math.trunc(options?.limit ?? 100), 1), 1000);
-    const prefix = referrersPrefix(name, digest);
+    const prefix = referrersPrefix(this.env, name, digest);
     const manifests: ReferrerDescriptor[] = [];
     const pageSize = Math.min(Math.max(limit + 1, 100), 1000);
 
     let objects = await this.env.REGISTRY.list({
       prefix,
       limit: pageSize,
-      startAfter: options?.last ? referrersPath(name, digest, options.last) : undefined,
+      startAfter: options?.last ? referrersPath(this.env, name, digest, options.last) : undefined,
     });
 
     while (true) {
@@ -536,7 +564,9 @@ export class R2Registry implements Registry {
       };
     }
     if (subjectDigest !== undefined) {
-      const [subjectManifest, subjectManifestErr] = await wrap(env.REGISTRY.head(`${name}/manifests/${subjectDigest}`));
+      const [subjectManifest, subjectManifestErr] = await wrap(
+        env.REGISTRY.head(withPrefix(env, `${name}/manifests/${subjectDigest}`)),
+      );
       if (subjectManifestErr) {
         return wrapError("putManifestInner", subjectManifestErr);
       }
@@ -566,7 +596,7 @@ export class R2Registry implements Registry {
     const putReference = async () => {
       // if the reference is the same as a digest, it's not necessary to insert
       if (reference === digestStr) return;
-      return await env.REGISTRY.put(`${name}/manifests/${reference}`, text, {
+      return await env.REGISTRY.put(withPrefix(env, `${name}/manifests/${reference}`), text, {
         sha256: digest,
         httpMetadata: {
           contentType,
@@ -578,7 +608,7 @@ export class R2Registry implements Registry {
     const putTasks: Promise<unknown>[] = [
       putReference(),
       // this is the "main" manifest
-      env.REGISTRY.put(`${name}/manifests/${digestStr}`, text, {
+      env.REGISTRY.put(withPrefix(env, `${name}/manifests/${digestStr}`), text, {
         sha256: digest,
         httpMetadata: {
           contentType,
@@ -589,7 +619,7 @@ export class R2Registry implements Registry {
 
     if (referrerDescriptor !== null && subjectDigest !== undefined) {
       putTasks.push(
-        env.REGISTRY.put(referrersPath(name, subjectDigest, digestStr), JSON.stringify(referrerDescriptor), {
+        env.REGISTRY.put(referrersPath(env, name, subjectDigest, digestStr), JSON.stringify(referrerDescriptor), {
           httpMetadata: {
             contentType: "application/json",
           },
@@ -606,7 +636,7 @@ export class R2Registry implements Registry {
   }
 
   async getManifest(name: string, reference: string): Promise<RegistryError | GetManifestResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/manifests/${reference}`));
+    const [res, err] = await wrap(this.env.REGISTRY.get(withPrefix(this.env, `${name}/manifests/${reference}`)));
     if (err) {
       return wrapError("getManifest", err);
     }
@@ -630,8 +660,12 @@ export class R2Registry implements Registry {
     digest: string,
     destinationName: string,
   ): Promise<RegistryError | FinishedUploadObject> {
+    // sourceLayerPath/destinationLayerPath are kept unprefixed here: they're
+    // stored as-is as the symlink pointer's body (and split back apart by
+    // getLayer()'s symlink-follow logic), so R2_KEY_PREFIX is only applied
+    // where these are used as the actual R2 key below.
     const sourceLayerPath = `${sourceName}/blobs/${digest}`;
-    const [res, err] = await wrap(this.env.REGISTRY.head(sourceLayerPath));
+    const [res, err] = await wrap(this.env.REGISTRY.head(withPrefix(this.env, sourceLayerPath)));
     if (err) {
       return wrapError("mountExistingLayer", err);
     }
@@ -651,7 +685,7 @@ export class R2Registry implements Registry {
 
       // Create linked file with custom metadata
       const [newFile, error] = await wrap(
-        this.env.REGISTRY.put(destinationLayerPath, sourceLayerPath, {
+        this.env.REGISTRY.put(withPrefix(this.env, destinationLayerPath), sourceLayerPath, {
           sha256: await getSHA256(sourceLayerPath, ""),
           httpMetadata: res.httpMetadata,
           customMetadata: { [symlinkHeader]: sourceName }, // Storing target repository name in metadata (to easily resolve recursive layer mounting)
@@ -672,7 +706,7 @@ export class R2Registry implements Registry {
   }
 
   async layerExists(name: string, tag: string): Promise<RegistryError | CheckLayerResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.head(`${name}/blobs/${tag}`));
+    const [res, err] = await wrap(this.env.REGISTRY.head(withPrefix(this.env, `${name}/blobs/${tag}`)));
     if (err) {
       return wrapError("layerExists", err);
     }
@@ -691,7 +725,7 @@ export class R2Registry implements Registry {
   }
 
   async getLayer(name: string, digest: string): Promise<RegistryError | GetLayerResponse> {
-    const [res, err] = await wrap(this.env.REGISTRY.get(`${name}/blobs/${digest}`));
+    const [res, err] = await wrap(this.env.REGISTRY.get(withPrefix(this.env, `${name}/blobs/${digest}`)));
     if (err) {
       return wrapError("getLayer", err);
     }
@@ -990,7 +1024,7 @@ export class R2Registry implements Registry {
         };
       }
 
-      await this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, stream, {
+      await this.env.REGISTRY.put(withPrefix(this.env, `${namespace}/blobs/${expectedSha}`), stream, {
         sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
       });
     } else {
@@ -998,7 +1032,7 @@ export class R2Registry implements Registry {
       // TODO: Handle one last buffer here
       await upload.complete(state.parts);
       const obj = await this.env.REGISTRY.get(uuid);
-      const put = this.env.REGISTRY.put(`${namespace}/blobs/${expectedSha}`, obj!.body, {
+      const put = this.env.REGISTRY.put(withPrefix(this.env, `${namespace}/blobs/${expectedSha}`), obj!.body, {
         sha256: (expectedSha as string).slice(SHA256_PREFIX_LEN),
       });
 
@@ -1006,7 +1040,7 @@ export class R2Registry implements Registry {
       await this.env.REGISTRY.delete(uuid);
     }
 
-    await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
+    await this.env.REGISTRY.delete(getRegistryUploadsPath(this.env, state));
 
     return {
       digest: expectedSha,
@@ -1028,7 +1062,7 @@ export class R2Registry implements Registry {
 
     const upload = this.env.REGISTRY.resumeMultipartUpload(state.registryUploadId, state.uploadId);
     await upload.abort();
-    await this.env.REGISTRY.delete(getRegistryUploadsPath(state));
+    await this.env.REGISTRY.delete(getRegistryUploadsPath(this.env, state));
     return true;
   }
 
@@ -1048,7 +1082,7 @@ export class R2Registry implements Registry {
       return false;
     }
 
-    await this.env.REGISTRY.put(`${namespace}/blobs/${sha256}`, stream, {
+    await this.env.REGISTRY.put(withPrefix(this.env, `${namespace}/blobs/${sha256}`), stream, {
       sha256: (sha256 as string).slice(SHA256_PREFIX_LEN),
     });
     return {
