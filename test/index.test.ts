@@ -2734,6 +2734,72 @@ describe("push and catalog", () => {
       bindings.R2_KEY_PREFIX = previousPrefix;
     }
   });
+
+  test("catalog pagination does not drop repositories once a page spans more repos than the requested page size", async () => {
+    // Regression test: listRepositories()'s third "catch-up" loop used to
+    // compare the *stale* outer-scope lastSeen against itself instead of
+    // the currently-iterated key, so it never detected the true page
+    // boundary and silently skipped every repository that was present in
+    // R2's internal 50-key page but never registered because the caller's
+    // small `n` had already been hit partway through that page.
+    const repoCount = 30; // 2 manifest keys each = 60 keys, > R2's internal 50-key page
+    const names = Array.from({ length: repoCount }, (_, i) => `catalog-page-${String(i).padStart(2, "0")}`);
+    for (const name of names) {
+      await createManifest(name, await generateManifest(name), "only-tag");
+    }
+
+    const repositoryBuildUp: string[] = [];
+    let currentPath = "/v2/_catalog?n=3";
+    for (let i = 0; i < repoCount + 5; i++) {
+      const response = await fetch(createRequest("GET", currentPath, null));
+      expect(response.ok).toBeTruthy();
+      const body = (await response.json()) as { repositories: string[] };
+      if (body.repositories.length === 0) break;
+      repositoryBuildUp.push(...body.repositories);
+      const url = parseLinkHeaderURL(response.headers.get("Link")!);
+      currentPath = url.pathname + url.search;
+    }
+
+    expect(repositoryBuildUp).toEqual(names);
+  });
+
+  test("catalog pagination does not drop repositories when a page spans more repos than n, with R2_KEY_PREFIX configured", async () => {
+    // Combines the two prior regression tests: the pagination catch-up loop
+    // must compare the currently-iterated key, stripped of R2_KEY_PREFIX, not
+    // the raw prefixed key (which never matches the unprefixed repository
+    // names in `repositories`, since those are stored stripped) and not the
+    // stale outer-scope lastSeen either. Neither of the two prior tests
+    // alone exercises both conditions together: the unprefixed 30-repo test
+    // can't tell a raw key from a stripped one when the prefix is "", and
+    // the prefixed 2-repo test never reaches this loop at all (too few
+    // repos to cross R2's internal 50-key page).
+    const bindings = env as Env;
+    const previousPrefix = bindings.R2_KEY_PREFIX;
+    bindings.R2_KEY_PREFIX = "artifacts/containers/";
+    try {
+      const repoCount = 30;
+      const names = Array.from({ length: repoCount }, (_, i) => `catalog-prefix-page-${String(i).padStart(2, "0")}`);
+      for (const name of names) {
+        await createManifest(name, await generateManifest(name), "only-tag");
+      }
+
+      const repositoryBuildUp: string[] = [];
+      let currentPath = "/v2/_catalog?n=3";
+      for (let i = 0; i < repoCount + 5; i++) {
+        const response = await fetch(createRequest("GET", currentPath, null));
+        expect(response.ok).toBeTruthy();
+        const body = (await response.json()) as { repositories: string[] };
+        if (body.repositories.length === 0) break;
+        repositoryBuildUp.push(...body.repositories);
+        const url = parseLinkHeaderURL(response.headers.get("Link")!);
+        currentPath = url.pathname + url.search;
+      }
+
+      expect(repositoryBuildUp).toEqual(names);
+    } finally {
+      bindings.R2_KEY_PREFIX = previousPrefix;
+    }
+  });
 });
 
 describe("normalizeR2KeyPrefix", () => {

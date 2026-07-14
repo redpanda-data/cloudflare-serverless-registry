@@ -363,8 +363,10 @@ export class GarbageCollector {
       return true;
     });
 
-    // Check for symlink before removal
-    if (unreferencedBlobs.size >= 0) {
+    // Check for symlink before removal. Set.size is always >= 0, so this
+    // guard was always true — skip the full-namespace list() scan below
+    // entirely when there's nothing unreferenced to protect.
+    if (unreferencedBlobs.size > 0) {
       // Scoped to our own namespace (this.prefix) rather than the whole
       // bucket, since that's the only place our own objects (and therefore
       // symlinks pointing at them) can live.
