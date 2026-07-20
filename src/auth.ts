@@ -1,4 +1,5 @@
-import { decodeBase64Loose, errorString } from "./utils";
+import { decodeBase64Loose, safeErrorString } from "./utils";
+import { log } from "./log";
 
 export type RegistryTokenCapability = "push" | "pull";
 export type RegistryAuthProtocolTokenPayload = {
@@ -257,7 +258,7 @@ export function stripUsernamePasswordFromHeader(r: Request): [string, string] | 
   // itself contains no whitespace.
   const match = authorization.match(/^\s*Basic\s+(\S+)\s*$/i);
   if (!match) {
-    console.warn("failed checkCredentials: Authorization doesn't include Basic scheme");
+    log.warn("basic_auth_scheme_invalid", { path: new URL(r.url).pathname, method: r.method });
     return { verified: false, payload: null };
   }
   const encoded = match[1];
@@ -284,7 +285,7 @@ export function stripUsernamePasswordFromHeader(r: Request): [string, string] | 
     const password = decoded.substring(index + 1);
     return [username, password];
   } catch (err) {
-    console.error(`Failure getting data from Authorization header: ${errorString(err)}`);
+    log.error("basic_auth_decode_failed", { error: safeErrorString(err) });
     return { verified: false, payload: null };
   }
 }

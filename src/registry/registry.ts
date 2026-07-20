@@ -1,8 +1,9 @@
 import { Env } from "../..";
 import { InternalError } from "../errors";
-import { errorString } from "../utils";
+import { safeErrorString } from "../utils";
 import z from "zod";
 import { GarbageCollectionMode } from "./garbage-collector";
+import { log } from "../log";
 
 // Defines a registry and how it's configured
 const registryConfiguration = z
@@ -33,7 +34,7 @@ export function registries(env: Env): RegistryConfiguration[] {
     const jsonObject = JSON.parse(env.REGISTRIES_JSON);
     return registryConfiguration.array().parse(jsonObject);
   } catch (err) {
-    console.error("Error parsing registries JSON: " + errorString(err));
+    log.error("registries_json_parse_error", { error: safeErrorString(err) });
     return [];
   }
 }
@@ -218,7 +219,7 @@ export interface Registry {
 }
 
 export function wrapError(method: string, err: unknown): RegistryError {
-  console.error(method, "error:", errorString(err));
+  log.error("registry_operation_error", { method, error: safeErrorString(err) });
   return {
     response: new InternalError(),
   };

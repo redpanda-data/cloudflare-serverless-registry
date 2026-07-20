@@ -1,6 +1,7 @@
 import { Env } from "../..";
 import { InternalError, ServerError } from "../errors";
-import { errorString } from "../utils";
+import { safeErrorString } from "../utils";
+import { log } from "../log";
 import { GarbageCollectionMode } from "./garbage-collector";
 import {
   CheckLayerResponse,
@@ -40,7 +41,7 @@ type HTTPContext = {
   // be included in every request, and can be combined with deeper namespaces
   repository: string;
   // If Basic based authentication, this is <username>':'<password> encoded in base64
-  // If Bearer based authentication, this is the token that was returned by the Oauth/token endpoint
+  // If Bearer based authentication, this is the token that was returned by the OAuth/token endpoint
   accessToken: string;
 };
 
@@ -54,6 +55,29 @@ export const manifestTypes = [
 ] as const;
 
 export type ManifestType = (typeof manifestTypes)[number];
+
+// Splits on "," but not when the comma falls inside a quoted value — an
+// auth-param value like `scope="repository:foo:pull,push"` legally contains
+// a literal comma per RFC 7235, and a blind split(",") tears it in half.
+function splitOutsideQuotes(value: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let insideQuotes = false;
+
+  for (const character of value) {
+    if (character === '"') {
+      insideQuotes = !insideQuotes;
+    } else if (character === "," && !insideQuotes) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  parts.push(current);
+
+  return parts;
+}
 
 function splitLinkHeaderValues(link: string): string[] {
   const values: string[] = [];
@@ -144,11 +168,7 @@ function normalizeReferrersCursor(nextURL: URL, requestURL: URL): string | undef
 function ctxIntoHeaders(ctx: HTTPContext): Headers {
   const headers = new Headers();
   if (ctx.authContext.authType === "none") {
-    console.warn(
-      "Your registry",
-      ctx.authContext.service,
-      "is not using any kind of authentication, making it exposed to the internet",
-    );
+    log.warn("upstream_registry_no_auth", { service: ctx.authContext.service });
     return headers;
   }
 
@@ -168,14 +188,21 @@ function ctxIntoRequest(ctx: HTTPContext, url: URL, method: string, path: string
   });
 }
 
-function authHeaderIntoAuthContext(urlObject: URL, authenticateHeader: string): AuthContext {
-  const url = urlObject.toString();
-  const parts = authenticateHeader.split(" ");
-  if (parts.length === 0) {
+export function authHeaderIntoAuthContext(urlObject: URL, authenticateHeader: string): AuthContext {
+  // .origin (not .toString()): a configured registry URL can embed userinfo
+  // credentials, and this value is interpolated into thrown/logged messages.
+  const url = urlObject.origin;
+  // Split off only the scheme token on the FIRST space: the auth-params that
+  // follow may legally contain further spaces (RFC 7235 permits optional
+  // whitespace after each comma, e.g. `Bearer realm="...", service="..."`),
+  // and a blanket split(" ") would cut through those too, dropping later
+  // auth-params into a part that's never read.
+  const firstSpace = authenticateHeader.indexOf(" ");
+  if (firstSpace === -1) {
     throw new Error(`can't retrieve WWW-Authenticate header in /v2 endpoint on registry ${url}: malformed`);
   }
 
-  const authType = parts[0].toLowerCase();
+  const authType = authenticateHeader.slice(0, firstSpace).toLowerCase();
   switch (authType) {
     case "bearer":
     case "basic":
@@ -183,10 +210,14 @@ function authHeaderIntoAuthContext(urlObject: URL, authenticateHeader: string): 
     case "none":
       throw new Error("unsupported auth type for getting an auth context");
     default:
-      throw new Error(`unsupported auth type in WWW-Authenticate on registry ${url}: ${parts[0]}`);
+      throw new Error(`unsupported auth type in WWW-Authenticate on registry ${url}: ${authType}`);
   }
 
-  const variables = parts[1].split(",");
+  // Split on commas OUTSIDE quoted values only: a quoted auth-param value may
+  // legally contain a literal comma (e.g. `scope="repository:foo:pull,push"`),
+  // and a blind split(",") tears it in half. Same technique as
+  // splitLinkHeaderValues below, minus the angle-bracket tracking.
+  const variables = splitOutsideQuotes(authenticateHeader.slice(firstSpace + 1));
   const authContextOptional: Partial<AuthContext> = {};
   variables.forEach((variable) => {
     const firstEqual = variable.indexOf("=");
@@ -194,8 +225,11 @@ function authHeaderIntoAuthContext(urlObject: URL, authenticateHeader: string): 
       throw new Error(`expected '=' but didn't encounter it on Auth header on registry ${url}`);
     }
 
-    const name = variable.slice(0, firstEqual);
-    let value = variable.slice(firstEqual + 1);
+    // WWW-Authenticate commonly has a space after each comma (e.g.
+    // `Bearer realm="...", service="..."`); untrimmed, `name` here would be
+    // " service" and never match the switch below.
+    const name = variable.slice(0, firstEqual).trim();
+    let value = variable.slice(firstEqual + 1).trim();
 
     if (value.length >= 2 && value[0] === `"` && value[value.length - 1] === `"`) {
       value = value.slice(1, value.length - 1);
@@ -208,7 +242,7 @@ function authHeaderIntoAuthContext(urlObject: URL, authenticateHeader: string): 
         authContextOptional[name] = value;
         break;
       default:
-        console.debug(`unknown auth attribute ${name} on registry ${url}`);
+        log.info("auth_attribute_unknown", { name, url });
     }
   });
 
@@ -289,7 +323,7 @@ export class RegistryHTTPClient implements Registry {
     // see https://distribution.github.io/distribution/spec/auth/token/
     const authenticateHeader = res.headers.get("WWW-Authenticate");
     if (authenticateHeader === null) {
-      throw new Error(`can't retrieve WWW-Authenticate header in /v2 endpoint on registry ${this.url.toString()}`);
+      throw new Error(`can't retrieve WWW-Authenticate header in /v2 endpoint on registry ${this.url.origin}`);
     }
 
     const authCtx = authHeaderIntoAuthContext(this.url, authenticateHeader);
@@ -316,7 +350,7 @@ export class RegistryHTTPClient implements Registry {
 
   async authenticateBearerSimple(ctx: AuthContext, params: URLSearchParams) {
     params.delete("password");
-    console.log("sending authentication parameters:", ctx.realm + "?" + params.toString());
+    log.info("auth_bearer_simple_request", { realm: ctx.realm });
 
     return await fetch(ctx.realm + "?" + params.toString(), {
       headers: {
@@ -344,58 +378,55 @@ export class RegistryHTTPClient implements Registry {
       method: "POST",
       body: params.toString(),
     });
-    if (response.status === 404 || response.status === 405 || response.status == 401) {
-      console.debug(
-        this.url.toString(),
-        "Oauth 404/401/405... Falling back to simple token authentication, see https://distribution.github.io/distribution/spec/auth/token",
-      );
+    if (response.status === 404 || response.status === 405 || response.status === 401) {
+      log.info("oauth_fallback_triggered", { url: this.url.origin });
       const responseSimple = await this.authenticateBearerSimple(ctx, params);
       if (responseSimple.ok) {
         response = responseSimple;
       } else {
-        console.error(`Oauth fallback also failed: ${responseSimple.status} ${await responseSimple.text()}`);
+        log.error("oauth_fallback_failed", {
+          url: this.url.origin,
+          realm: ctx.realm,
+          status: responseSimple.status,
+          contentLength: responseSimple.headers.get("content-length"),
+        });
       }
     }
 
     if (!response.ok) {
+      // Don't interpolate the body: on the success-shaped path this response
+      // can carry a real access token, and this message is logged upstream
+      // via safeErrorString(err).
       throw new Error(
-        `unexpected ${response.status} from ${this.url.toString()} when Oauth authenticating: ${await response.text()}`,
+        `unexpected ${response.status} from ${this.url.origin} when OAuth authenticating (content-length: ${response.headers.get("content-length")})`,
       );
     }
 
     const t = await response.text();
     try {
-      const response: {
+      const tokenResponse: {
         access_token?: string;
         expires_in: number;
         repository: string;
         token?: string;
       } = JSON.parse(t);
-      console.debug(
-        `Authenticated with registry ${this.url.toString()} successfully, got token that expires in ${
-          response.expires_in
-        } seconds`,
-      );
+      log.info("oauth_token_acquired", { url: this.url.origin, expiresIn: tokenResponse.expires_in });
 
-      if (!response.access_token && !response.token) {
-        console.error(
-          "Oauth response doesn't have access_token field, doing fallback to password_env, however this might mean that we will 401 later",
-        );
+      if (!tokenResponse.access_token && !tokenResponse.token) {
+        log.error("oauth_response_missing_token", { url: this.url.origin });
       }
 
       return {
         authContext: ctx,
-        repository: response.repository ?? this.url.pathname,
-        accessToken: response.access_token ?? response.token ?? this.authBase64(),
+        repository: tokenResponse.repository ?? this.url.pathname,
+        accessToken: tokenResponse.access_token ?? tokenResponse.token ?? this.authBase64(),
       };
     } catch (err) {
-      console.error(
-        "Doing json response in authentication: ",
-        errorString(err),
-        t.slice(0, Math.min(t.length, 100)),
-        "status",
-        response.status,
-      );
+      log.error("oauth_json_parse_error", {
+        error: safeErrorString(err),
+        bodyLength: t.length,
+        status: response.status,
+      });
       throw err;
     }
   }
@@ -426,13 +457,14 @@ export class RegistryHTTPClient implements Registry {
       req.headers.append("Accept", manifestTypes.join(", "));
       const res = await fetch(req);
       if (!res.ok && res.status !== 404) {
-        console.warn(req.url, "->", res.status, "getting manifest:", await res.text());
+        // HEAD has no response body to log — nothing to read here.
+        log.warn("manifest_exists_unexpected_status", { url: req.url, status: res.status });
         return {
           response: res,
         };
       }
 
-      console.log("->", req.url, res.status);
+      log.info("manifest_exists_checked", { url: req.url, status: res.status });
       return {
         exists: res.ok,
         digest: res.headers.get("Docker-Content-Digest") as string,
@@ -440,7 +472,7 @@ export class RegistryHTTPClient implements Registry {
         contentType: res.headers.get("Content-Type") ?? "",
       };
     } catch (err) {
-      console.error(`Error doing manifest exists with ${namespace} and ${tag}: ` + errorString(err));
+      log.error("manifest_exists_error", { namespace, tag, error: safeErrorString(err) });
       return {
         response: new InternalError(),
       };
@@ -454,7 +486,7 @@ export class RegistryHTTPClient implements Registry {
       const req = ctxIntoRequest(ctx, this.url, "GET", `${namespace}/manifests/${digest}`);
       req.headers.append("Accept", manifestTypes.join(", "));
       const res = await fetch(req);
-      console.log(req.method, res.status, res.url);
+      log.info("manifest_fetched", { method: req.method, status: res.status, url: res.url });
       if (!res.ok) {
         return {
           response: res,
@@ -472,7 +504,7 @@ export class RegistryHTTPClient implements Registry {
         contentType: res.headers.get("Content-Type") ?? "",
       };
     } catch (err) {
-      console.error(`Error doing get manifest with ${namespace} and ${digest}: ` + errorString(err));
+      log.error("get_manifest_error", { namespace, digest, error: safeErrorString(err) });
       return {
         response: new InternalError(),
       };
@@ -512,7 +544,7 @@ export class RegistryHTTPClient implements Registry {
         digest: res.headers.get("Docker-Content-Digest") ?? digest,
       };
     } catch (err) {
-      console.error(`Error doing layer exists with ${namespace} and ${digest}: ` + errorString(err));
+      log.error("layer_exists_error", { namespace, digest, error: safeErrorString(err) });
       return {
         response: new InternalError(),
       };
@@ -555,7 +587,7 @@ export class RegistryHTTPClient implements Registry {
         digest: res.headers.get("Digest-Content-Digest") ?? digest,
       };
     } catch (err) {
-      console.error(`Error doing get layer with ${namespace} and ${digest}: ` + errorString(err));
+      log.error("get_layer_error", { namespace, digest, error: safeErrorString(err) });
       return {
         response: new InternalError(),
       };
@@ -613,7 +645,7 @@ export class RegistryHTTPClient implements Registry {
       }
 
       const res = await fetch(req);
-      console.log(req.method, res.status, res.url);
+      log.info("referrers_fetched", { method: req.method, status: res.status, url: res.url });
       if (!res.ok) {
         return {
           response: res,
@@ -649,7 +681,7 @@ export class RegistryHTTPClient implements Registry {
         cursor,
       };
     } catch (err) {
-      console.error(`Error doing list referrers with ${namespace} and ${digest}: ` + errorString(err));
+      log.error("list_referrers_error", { namespace, digest, error: safeErrorString(err) });
       return {
         response: new InternalError(),
       };

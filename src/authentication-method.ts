@@ -2,23 +2,25 @@ import { Env } from "..";
 import { newRegistryTokens, parseJwtAlgorithm } from "./token";
 import { UserAuthenticator } from "./user";
 import type { AuthenticatorCredentials } from "./user";
+import { log } from "./log";
+import { safeErrorString } from "./utils";
 
 export async function authenticationMethodFromEnv(env: Env) {
   if (env.JWT_REGISTRY_TOKENS_PUBLIC_KEY) {
-    // Fail closed on a typo in JWT_REGISTRY_TOKENS_ALGORITHM. Letting the
-    // throw escape would surface as an unhandled 500 (the caller invokes
-    // this outside the request try/catch in index.ts); a misconfigured
-    // algorithm should look like "auth not configured" instead.
-    let algorithm;
+    // Fail closed on a typo in JWT_REGISTRY_TOKENS_ALGORITHM or a malformed
+    // JWT_REGISTRY_TOKENS_PUBLIC_KEY (bad base64, or base64 that decodes to
+    // non-JSON — importKeyFromBase64 throws on either). A thrown error that
+    // escapes this local catch would unwind into index.ts's outer catch,
+    // which logs unhandled_error and returns a generic 500; either
+    // misconfiguration should look like "auth not configured" (a 401
+    // config_error) instead.
     try {
-      algorithm = parseJwtAlgorithm(env.JWT_REGISTRY_TOKENS_ALGORITHM);
+      const algorithm = parseJwtAlgorithm(env.JWT_REGISTRY_TOKENS_ALGORITHM);
+      return await newRegistryTokens(env.JWT_REGISTRY_TOKENS_PUBLIC_KEY, algorithm, env.JWT_REGISTRY_TOKENS_DENY_LIST);
     } catch (err) {
-      console.error(
-        `authenticationMethodFromEnv: ${(err as Error).message}. JWT authentication is disabled until corrected.`,
-      );
+      log.error("jwt_auth_config_invalid", { error: safeErrorString(err) });
       return undefined;
     }
-    return await newRegistryTokens(env.JWT_REGISTRY_TOKENS_PUBLIC_KEY, algorithm, env.JWT_REGISTRY_TOKENS_DENY_LIST);
   } else if ((env.USERNAME && env.PASSWORD) || (env.READONLY_USERNAME && env.READONLY_PASSWORD)) {
     const credentials: AuthenticatorCredentials[] = [];
 
@@ -32,9 +34,9 @@ export async function authenticationMethodFromEnv(env: Env) {
     return new UserAuthenticator(credentials);
   }
 
-  console.error(
-    "Either env.JWT_REGISTRY_TOKENS_PUBLIC_KEY must be set or both env.USERNAME, env.PASSWORD must be set or both env.READONLY_USERNAME, env.READONLY_PASSWORD must be set.",
-  );
+  log.error("auth_method_misconfigured", {
+    hint: "Either env.JWT_REGISTRY_TOKENS_PUBLIC_KEY must be set or both env.USERNAME, env.PASSWORD must be set or both env.READONLY_USERNAME, env.READONLY_PASSWORD must be set.",
+  });
 
   // invalid configuration
   return undefined;

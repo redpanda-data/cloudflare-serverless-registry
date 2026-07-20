@@ -15,7 +15,7 @@ import { AuthErrorResponse } from "../src/errors";
 import { registries } from "../src/registry/registry";
 import { normalizeR2KeyPrefix } from "../src/registry/r2";
 import type { ReferrerDescriptor } from "../src/registry/registry";
-import { isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
+import { authHeaderIntoAuthContext, isDockerDotIO, RegistryHTTPClient } from "../src/registry/http";
 import { encode } from "@cfworker/base64url";
 import { ManifestSchema } from "../src/manifest";
 import { limit } from "../src/chunk";
@@ -2019,7 +2019,7 @@ test("registries configuration", async () => {
     {
       configuration: "{}",
       expected: [],
-      error: "Error parsing registries JSON: zod error:\n✖ Invalid input: expected array, received object",
+      error: "zod error:\n✖ Invalid input: expected array, received object",
       partialError: false,
     },
     {
@@ -2037,7 +2037,7 @@ test("registries configuration", async () => {
     {
       configuration: "bla bla bla no json",
       expected: [],
-      error: "Error parsing registries JSON: error SyntaxError: Unexpected token",
+      error: "error SyntaxError: Unexpected token",
       partialError: true,
     },
     {
@@ -2103,19 +2103,59 @@ test("registries configuration", async () => {
     let calledError = false;
     const prevConsoleError = console.error;
     console.error = (output) => {
+      const parsed = JSON.parse(output as string);
+      expect(parsed).toMatchObject({ level: "error", event: "registries_json_parse_error" });
       if (!testCase.partialError) {
-        expect(output).toEqual(testCase.error);
+        expect(parsed.error).toEqual(testCase.error);
       } else {
-        expect(output).toContain(testCase.error);
+        expect(parsed.error).toContain(testCase.error);
       }
 
       calledError = true;
     };
-    const r = registries(bindingCopy);
-    expect(r).toEqual(testCase.expected);
-    expect(calledError).toEqual(expectErrorOutput);
-    console.error = prevConsoleError;
+    try {
+      const r = registries(bindingCopy);
+      expect(r).toEqual(testCase.expected);
+      expect(calledError).toEqual(expectErrorOutput);
+    } finally {
+      console.error = prevConsoleError;
+    }
   }
+});
+
+describe("authHeaderIntoAuthContext", () => {
+  test("parses realm and service whether or not there's a space after the comma", () => {
+    const url = new URL("https://registry.example.com");
+    const noSpace = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token",service="registry.example.com"`,
+    );
+    const withSpace = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token", service="registry.example.com"`,
+    );
+    expect(noSpace).toEqual({
+      authType: "bearer",
+      realm: "https://auth.example.com/token",
+      service: "registry.example.com",
+      scope: "",
+    });
+    expect(withSpace).toEqual(noSpace);
+  });
+
+  test("does not mis-split a quoted scope value that contains a literal comma", () => {
+    const url = new URL("https://registry.example.com");
+    const ctx = authHeaderIntoAuthContext(
+      url,
+      `Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:foo:pull,push"`,
+    );
+    expect(ctx).toEqual({
+      authType: "bearer",
+      realm: "https://auth.example.com/token",
+      service: "registry.example.com",
+      scope: "repository:foo:pull,push",
+    });
+  });
 });
 
 describe("http client", () => {
@@ -2735,6 +2775,11 @@ describe("push and catalog", () => {
     }
   });
 
+  // These two 30-repo pagination tests do real sequential work (30 manifest
+  // creates + up to 35 paginated catalog requests each) that's marginal
+  // against vitest's 5000ms default under CI load — observed flaking at
+  // ~5.4s on a loaded runner while passing locally every time — so both
+  // pass an explicit longer timeout as their third argument.
   test("catalog pagination does not drop repositories once a page spans more repos than the requested page size", async () => {
     // Regression test: listRepositories()'s third "catch-up" loop used to
     // compare the *stale* outer-scope lastSeen against itself instead of
@@ -2761,7 +2806,7 @@ describe("push and catalog", () => {
     }
 
     expect(repositoryBuildUp).toEqual(names);
-  });
+  }, 15000);
 
   test("catalog pagination does not drop repositories when a page spans more repos than n, with R2_KEY_PREFIX configured", async () => {
     // Combines the two prior regression tests: the pagination catch-up loop
@@ -2799,7 +2844,7 @@ describe("push and catalog", () => {
     } finally {
       bindings.R2_KEY_PREFIX = previousPrefix;
     }
-  });
+  }, 15000);
 });
 
 describe("normalizeR2KeyPrefix", () => {

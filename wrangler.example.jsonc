@@ -16,6 +16,7 @@
     // Production
     "production": {
       "r2_buckets": [{ "binding": "REGISTRY", "bucket_name": "" }],
+      "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "dp_artifact_metrics" }],
       "vars": {
         "JWT_REGISTRY_TOKENS_PUBLIC_KEY": "",
         // Prefix applied to every R2 object key this Worker writes/reads, to
@@ -30,6 +31,7 @@
     // Dev - For local dev using `npx wrangler dev`
     "dev": {
       "r2_buckets": [{ "binding": "REGISTRY", "bucket_name": "r2-image-registry-dev" }],
+      "analytics_engine_datasets": [{ "binding": "METRICS", "dataset": "dp_artifact_metrics_dev" }],
       "vars": {
         // "REGISTRIES_JSON": "[{ \"registry\": \"http://localhost:9999\", \"password_env\": \"PASSWORD\", \"username\": \"hello\" }]",
         "USERNAME": "hello",

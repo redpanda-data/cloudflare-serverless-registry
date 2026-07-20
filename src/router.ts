@@ -1,11 +1,12 @@
 import { Router } from "itty-router";
 import { BlobUnknownError, ManifestUnknownError } from "./v2-errors";
 import { InternalError, ServerError } from "./errors";
-import { errorString, jsonHeaders, wrap } from "./utils";
+import { jsonHeaders, safeErrorString, wrap } from "./utils";
 import { hexToDigest, isValidDigest } from "./user";
 import { getRequestAuthPayload, scopeAuthorizes } from "./auth";
 import { ManifestTagsListTooBigError } from "./v2-responses";
 import { Env } from "..";
+import { log } from "./log";
 import { MINIMUM_CHUNK, MAXIMUM_CHUNK, MAXIMUM_CHUNK_UPLOAD_SIZE } from "./chunk";
 import {
   CheckLayerResponse,
@@ -185,10 +186,7 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       if ("exists" in res && !res.exists) {
         const manifestResponse = await client.getManifest(name, response.digest);
         if ("response" in manifestResponse) {
-          console.warn(
-            "Can't sync with fallback registry because it has returned an error:",
-            manifestResponse.response.status,
-          );
+          log.warn("manifest_fallback_sync_failed", { name, reference, status: manifestResponse.response.status });
           break;
         }
 
@@ -199,11 +197,11 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
           }),
         );
         if (err) {
-          console.error("Error sync manifest into client:", errorString(err));
+          log.error("manifest_sync_error", { name, reference, error: safeErrorString(err) });
         }
 
         if (putResponse && "response" in putResponse) {
-          console.error("Error sync manifest into client (non 200 status):", putResponse.response.status);
+          log.error("manifest_sync_failed", { name, reference, status: putResponse.response.status });
         }
       }
 
@@ -266,12 +264,12 @@ v2Router.get("/:name+/manifests/:reference", async (req, env: Env, context: Exec
           }),
         );
         if (err) {
-          console.error("Error uploading asynchronously the manifest ", reference, "into main registry");
+          log.error("manifest_async_upload_error", { name, reference, error: safeErrorString(err) });
           return;
         }
 
         if (response && "response" in response) {
-          console.error("Error uploading asynchronously manifest:", response.response.status);
+          log.error("manifest_async_upload_failed", { name, reference, status: response.response.status });
         }
       })(),
     );
@@ -301,7 +299,7 @@ v2Router.put("/:name+/manifests/:reference", async (req, env: Env) => {
     env.REGISTRY_CLIENT.putManifest(name, reference, req.body!, { contentType: req.headers.get("Content-Type")! }),
   );
   if (err) {
-    console.error("Error putting manifest:", errorString(err));
+    log.error("put_manifest_error", { name, reference, error: safeErrorString(err) });
     return new InternalError();
   }
 
@@ -432,12 +430,12 @@ v2Router.get("/:name+/blobs/:digest", async (req, env: Env, context: ExecutionCo
       (async () => {
         const [response, err] = await wrap(env.REGISTRY_CLIENT.monolithicUpload(name, digest, s2, layerResponse.size));
         if (err) {
-          console.error("Error uploading asynchronously the layer ", digest, "into main registry");
+          log.error("layer_async_upload_error", { name, digest, error: safeErrorString(err) });
           return;
         }
 
         if (response === false) {
-          console.error("Layer might be too big for the registry client", layerResponse.size);
+          log.error("layer_too_big", { name, digest, size: layerResponse.size });
         }
       })(),
     );
@@ -463,7 +461,7 @@ v2Router.delete("/:name+/blobs/uploads/:id", async (req, env: Env) => {
   const { name, id } = req.params;
   const [res, err] = await wrap<true | RegistryError, Error>(env.REGISTRY_CLIENT.cancelUpload(name, id));
   if (err) {
-    console.error("Error cancelling upload:", errorString(err));
+    log.error("cancel_upload_error", { name, id, error: safeErrorString(err) });
     return new InternalError();
   }
 
@@ -610,7 +608,7 @@ v2Router.patch("/:name+/blobs/uploads/:uuid", async (req, env: Env) => {
     ),
   );
   if (err) {
-    console.error("Uploading chunk:", errorString(err));
+    log.error("chunk_upload_error", { name, uuid, error: safeErrorString(err) });
     return new InternalError();
   }
 

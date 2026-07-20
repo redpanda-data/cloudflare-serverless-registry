@@ -76,6 +76,19 @@ export function errorString(err: unknown): string {
   return "unknown error: " + JSON.stringify(err);
 }
 
+// errorString()'s non-Error fallback does JSON.stringify(err), which can
+// itself throw (e.g. circular data). Callers logging from inside an
+// already-best-effort or already-erroring path (a metrics write failure, a
+// generic unhandled-error handler) must not lose that log line to a second,
+// unrelated throw — fall back to String(err) instead.
+export function safeErrorString(err: unknown): string {
+  try {
+    return errorString(err);
+  } catch {
+    return String(err);
+  }
+}
+
 export async function wrap<T, E = unknown>(fn: Promise<T>): Promise<[T, null] | [null, E]> {
   return fn.then((data) => [data, null] as [T, null]).catch((err) => [null, err as unknown as E] as [null, E]);
 }
