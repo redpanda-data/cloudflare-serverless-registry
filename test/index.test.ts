@@ -2775,6 +2775,11 @@ describe("push and catalog", () => {
     }
   });
 
+  // These two 30-repo pagination tests do real sequential work (30 manifest
+  // creates + up to 35 paginated catalog requests each) that's marginal
+  // against vitest's 5000ms default under CI load — observed flaking at
+  // ~5.4s on a loaded runner while passing locally every time — so both
+  // pass an explicit longer timeout as their third argument.
   test("catalog pagination does not drop repositories once a page spans more repos than the requested page size", async () => {
     // Regression test: listRepositories()'s third "catch-up" loop used to
     // compare the *stale* outer-scope lastSeen against itself instead of
@@ -2801,7 +2806,7 @@ describe("push and catalog", () => {
     }
 
     expect(repositoryBuildUp).toEqual(names);
-  });
+  }, 15000);
 
   test("catalog pagination does not drop repositories when a page spans more repos than n, with R2_KEY_PREFIX configured", async () => {
     // Combines the two prior regression tests: the pagination catch-up loop
@@ -2839,7 +2844,7 @@ describe("push and catalog", () => {
     } finally {
       bindings.R2_KEY_PREFIX = previousPrefix;
     }
-  });
+  }, 15000);
 });
 
 describe("normalizeR2KeyPrefix", () => {
