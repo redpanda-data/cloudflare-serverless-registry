@@ -164,6 +164,13 @@ v2Router.head("/:name+/manifests/:reference", async (req, env: Env) => {
       },
     });
   }
+  if ("response" in res) {
+    // A genuine R2 backend error (wrapError() in registry.ts), not "this
+    // manifest doesn't exist locally" — must not fall through to the
+    // mirror-then-404 path below, which would make a real storage outage
+    // indistinguishable from an ordinary not-found existence-check.
+    return res.response;
+  }
 
   let checkManifestResponse: CheckManifestResponse | null = null;
   const registryList = registries(env);

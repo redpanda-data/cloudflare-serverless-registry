@@ -74,6 +74,18 @@ router.all("/v2/*", v2Router.fetch);
 
 router.all("*", () => new Response("Not Found.", { status: 404 }));
 
+// Matches exactly the two existence-check routes registered in src/router.ts
+// ("/:name+/manifests/:reference" and "/:name+/blobs/:tag", both mounted
+// under "/v2/"): itty-router's `:name+` compiles to zero-or-more path
+// segments (an empty name, e.g. a leading "//", still dispatches to the same
+// handler), then a fixed "manifests" or "blobs" segment, then exactly one
+// more segment for the reference/tag. Deliberately narrower than "any HEAD
+// 404" — see the fetch handler below. The leading `.*` (not `.+`) and
+// trailing `\/*` both mirror itty-router's own compiled route semantics --
+// without them, an empty-name or trailing-slash request still dispatches to
+// the same handler with the same params, but this regex would miss it.
+const OCI_EXISTENCE_CHECK_PATH = /^\/v2\/.*\/(manifests|blobs)\/[^/]+\/*$/;
+
 function recordMetric(env: Env, outcome: string, status: number, durationMs: number): void {
   // blobs[0] is a fixed "registry" source tag: the METRICS dataset is shared
   // with the auth Worker (a separate deployable, instrumented in the
@@ -166,7 +178,28 @@ export default {
       // against < 400 rather than res.ok (200-299 only): a 304 Not Modified
       // from maybeNotModified() on a warm docker-pull cache hit is a
       // legitimate, by-design outcome, not an error.
-      recordMetric(env, res.status < 400 ? "success" : "response_error", res.status, elapsed());
+      //
+      // A HEAD request answered 404 on a manifest/blob existence-check path
+      // is the routine check every docker/buildx/crane push issues before
+      // uploading, to see if it's already present — "not found yet" is the
+      // designed, expected answer for a new tag or a new layer not already
+      // cached, not a backend/config failure. Tagging it "response_error"
+      // the same as a genuine origin failure would make ordinary push
+      // traffic swamp the alerting Worker's error rate, the same
+      // false-positive shape anonymous_probe (above) already prevents for
+      // ordinary unauthenticated preflight — hence the same "_probe" suffix
+      // convention. Scoped to exactly this path shape (not any HEAD 404)
+      // deliberately: a HEAD 404 anywhere else still means something the
+      // router doesn't recognize, which is a real routing signal worth
+      // keeping visible, not something to fold into the same benign bucket.
+      const isExistenceCheckPath = OCI_EXISTENCE_CHECK_PATH.test(new URL(request.url).pathname);
+      const outcome =
+        request.method === "HEAD" && res.status === 404 && isExistenceCheckPath
+          ? "not_found_probe"
+          : res.status < 400
+            ? "success"
+            : "response_error";
+      recordMetric(env, outcome, res.status, elapsed());
       return res;
     } catch (err) {
       if (err instanceof Response) {
